@@ -1,0 +1,101 @@
+name: docker-smoke
+
+# Proves the committed compose stack actually builds and boots. It is the only
+# CI in the repo and it needs NO secrets: every value in docker-compose.yml is a
+# ${VAR:-} passthrough, so with no .env present every integration resolves to
+# empty. The API boots in its documented mock-degraded mode (no Neon, no Twilio,
+# no LLM) and still serves /api/health 200. This is an integration-less smoke
+# test of the packaging, not of the product.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# This job only checks out code and runs Docker. Read-only is the floor.
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # Cold build = two node:22-slim installs + `next build`; 30 min is generous.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file parses and every variable interpolates
+        run: docker compose config -q
+
+      # Proves the api Dockerfile's `bun install --frozen-lockfile` (bun.lock is
+      # the only root lockfile, so npm ci cannot be used) plus its tsx presence
+      # gate, and the web Dockerfile's `npm ci` + `next build` typecheck.
+      - name: Build the api and web images
+        run: docker compose build
+
+      - name: Boot the stack
+        run: docker compose up -d
+
+      # `up -d` only waits for the healthchecks, so poll the published edge
+      # before asserting. The loop itself does not fail the job; the assertions
+      # below are what turn "never came up" into a red build.
+      - name: Wait for the edge to answer
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost/healthz >/dev/null && break
+            sleep 2
+          done
+          sleep 3
+
+      - name: Assert the edge is alive
+        # /healthz is served by nginx itself, so this also proves the mounted
+        # docker/nginx.conf is valid — a bad conf fails to load and nginx exits.
+        run: curl -sf http://localhost/healthz | grep -q ok
+
+      - name: Assert /api/* reached Express
+        # /api/health is unauthenticated and never touches Postgres, so a 200
+        # isolates "the API process is serving" from "the database is reachable".
+        # The body must be Express's own JSON: an empty set of integrations
+        # reported as false is the expected mock-mode answer, still a 200.
+        run: |
+          curl -sf http://localhost/api/health | grep -qE '"status": *"healthy"'
+
+      - name: Assert / reached Next
+        # The main unproven risk: `next start` serving the prebuilt .next with
+        # devDependencies omitted. The rewrite origin is baked at build time, so
+        # this only passes if API_ORIGIN was actually passed to the build stage.
+        run: curl -sf -o /dev/null http://localhost/
+
+      - name: Assert an unknown /api/* path is Express's JSON 404
+        # Status alone cannot tell the two upstreams apart (Next also 404s), so
+        # also require the body of the API's 404 guard — impossible for a Next
+        # HTML page to produce, and it proves /api/* was proxied to api:3000.
+        run: |
+          code=$(curl -s -o /tmp/api404 -w '%{http_code}' http://localhost/api/__smoke_404__)
+          test "$code" = 404
+          grep -qF 'No API route matches' /tmp/api404
+
+      - name: Assert /webhooks/* reached Express
+        # 500 is the expected value, not an error: NODE_ENV defaults to
+        # production and TWILIO_AUTH_TOKEN is unset, so the signature check
+        # refuses the request outright (server.ts:135-138) — that is the
+        # fail-closed path. A 404/405 here would mean nginx handed the webhook
+        # to Next, which is exactly the misconfiguration this asserts against.
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost/webhooks/twilio/voice)
+          test "$code" = 500
+
+      # `always()` so a failed build or boot is still diagnosable from the log
+      # rather than just "the job went red". Diagnostics never flip the result.
+      - name: Container state and logs
+        if: always()
+        run: |
+          docker compose ps || true
+          docker compose logs --no-color --tail=40 edge || true
+          docker compose logs --no-color --tail=40 api || true
+          docker compose logs --no-color --tail=40 web || true
+
+      # On both paths: a green job that leaves containers up would poison the
+      # next run's port binding and stale state.
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans || true

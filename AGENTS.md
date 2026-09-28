@@ -33,9 +33,11 @@ npm run lint         # this is just `tsc --noEmit`
 - `PORT` is env-configurable with 3000 as the local-dev fallback (`server.ts:53-55`), so hosts that
   inject a dynamic port are honoured. The web scripts are pinned to 3001 by `apps/web/package.json`.
 - Tests run on the real node test runner and are **server-side only** (`packages/`, 159 tests).
-  There is **no ESLint, no Prettier, no CI, no husky, no browser-test setup** — `npm run lint`
-  (which is `tsc --noEmit`) plus `npm test` is the entire verification story. The baseline **is
-  clean** (verified: `npx tsc --noEmit` exits 0), so any error you see is yours — don't excuse it.
+  There is **no ESLint, no Prettier, no husky, no browser-test setup** — `npm run lint`
+  (which is `tsc --noEmit`) plus `npm test` is the entire *local* verification story. The baseline
+  **is clean** (verified: `npx tsc --noEmit` exits 0), so any error you see is yours — don't
+  excuse it. The one CI job is `.github/workflows/docker-smoke.yml`: it builds and boots the
+  compose stack on every push to `main` (integration-less smoke — no DB/Twilio/LLM).
 - **Keep `--legacy-peer-deps` on the root install.** The peer conflict that originally forced the
   flag is gone, but keep it anyway: root (`bun.lock`) and `apps/web` (`package-lock.json`) are two
   independent installs, and a bare `npm install` at the root writes a competing root lockfile next

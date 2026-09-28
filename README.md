@@ -317,6 +317,10 @@ way to tell a real deployment from the silent mock fallback.
   without a `package-lock.json` the repo deliberately does not have. The web image uses `npm ci`
   against `apps/web/package-lock.json` and builds with `next build`. Both start with the same
   commands as local dev (`npm start` / `npm run start`), i.e. npm + tsx/next, unchanged.
+- **CI**: `.github/workflows/docker-smoke.yml` builds and boots this whole stack on every push to
+  `main` — no secrets, so the API runs in mock mode — and asserts the edge, the `/api/*` and
+  `/webhooks/*` → `api` split, and a 200 from Next. It is the first real proof that the
+  Dockerfiles work without installing Docker locally.
 - **No volumes**: no app state is persisted anywhere — the database is managed Neon. Container logs
   are capped at 3 × 10 MB so a long-running host cannot fill its disk.
 - **TLS**: the stack is plain HTTP on `:80`. In `NODE_ENV=production` the session cookie is issued
