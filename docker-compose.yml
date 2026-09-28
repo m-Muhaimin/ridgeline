@@ -1,0 +1,164 @@
+# RidgeLine — production-shaped local/host deployment.
+#
+#   docker compose up -d --build      # edge on http://localhost
+#   docker compose ps                 # health per service
+#   docker compose down               # tear down
+#
+# Topology: `edge` (nginx:alpine) is the only published port. It path-splits the
+# public origin — /api/* and /webhooks/* to `api`, everything else to `web` — so
+# the browser keeps talking to a single host and the session cookie works
+# unchanged. The app containers are exposed on the compose network only; nothing
+# is published for :3000 or :3001, which also stops the Next rewrite from being
+# bypassed.
+#
+# No volumes: neither app has local state, the database is managed Neon.
+#
+# SECRETS: this file hardcodes none. Every value below is interpolated from the
+# environment, and `docker compose` reads a `.env` file from this directory
+# (repo root) automatically. That file is gitignored (.gitignore covers `.env*`
+# except `.env.example`) — copy .env.example, fill it in, never commit it.
+# Compose will NOT fail if a variable is missing; the API silently degrades to
+# in-memory mocks instead, so check `docker compose logs api` and
+# `curl -s localhost/api/health` before believing anything is wired up.
+#
+# Requires Docker with Compose v2 (`docker compose version`).
+
+name: ridgeline
+
+# Bounded log files: the default json-file driver grows without limit and will
+# fill a small host's disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ridgeline-api:local
+    init: true
+    restart: unless-stopped
+    # The API opens no files and writes nothing; /tmp is tmpfs'd for npm's cache.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # production = fail closed: Twilio signature verification is mandatory and
+      # session cookies are Secure/None. Set NODE_ENV=development (in .env) only
+      # for a plain-HTTP local trial — see the README's Docker section.
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: "3000"
+      # REQUIRED. Rebuilt into the Twilio signature validation URL; also seeds
+      # the same-origin allow-list. Must be the exact public origin
+      # (scheme://host[:port]) users visit, or webhooks 403.
+      APP_URL: ${APP_URL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # Database (managed Neon / Lakebase Postgres). Unset => pool stays null and
+      # every route serves in-memory data.
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL_UNPOOLED: ${DATABASE_URL_UNPOOLED:-}
+      # Session/cookie signing. Unset => the server falls back to hardcoded
+      # constants, one of which is literally named "-production".
+      JWT_SECRET: ${JWT_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      COOKIE_SECRET: ${COOKIE_SECRET:-}
+      # Twilio. Unset => nothing is ever sent and signature checks are skipped
+      # in non-production.
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER:-}
+      # LLM: OpenAI-compatible gateway first, then Gemini, then a rule-based
+      # fallback. All three unset is survivable but not useful.
+      OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+      OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Optional Neon Functions / S3 gateway wiring used by /api/neon/*.
+      NEON_PROJECT_ID: ${NEON_PROJECT_ID:-}
+      NEON_BRANCH: ${NEON_BRANCH:-}
+      NEON_FUNCTION_API_BASE_URL: ${NEON_FUNCTION_API_BASE_URL:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ENDPOINT_URL_S3: ${AWS_ENDPOINT_URL_S3:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    expose:
+      - "3000"
+    healthcheck:
+      # Overrides the image's own HEALTHCHECK with a faster poll so dependent
+      # services start sooner. Keep the target in sync with Dockerfile.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    networks:
+      - ridgeline
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      # The /api/* rewrite is baked into .next at build time, so this has to
+      # reach the build stage, not just the runtime container.
+      args:
+        API_ORIGIN: ${WEB_API_ORIGIN:-http://api:3000}
+    image: ridgeline-web:local
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      # Same value as the build arg above — `next start` re-reads next.config.ts.
+      API_ORIGIN: ${WEB_API_ORIGIN:-http://api:3000}
+    expose:
+      - "3001"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # Overrides the image's own HEALTHCHECK; keep in sync with Dockerfile.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    networks:
+      - ridgeline
+
+  edge:
+    image: nginx:alpine
+    init: true
+    restart: unless-stopped
+    ports:
+      # Public entrypoint. Put a TLS terminator in front of this (or bind 443
+      # here) for a real deployment — see the README on the Secure session
+      # cookie.
+      - "80:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging: *default-logging
+    networks:
+      - ridgeline
+
+networks:
+  ridgeline:
+    driver: bridge

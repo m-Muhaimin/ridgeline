@@ -1,0 +1,41 @@
+# Root build context for the API image (docker-compose.yml -> build.context: .).
+# The web app is built from apps/web as its OWN context, so it is excluded here
+# outright: nothing in this image may reference it, and keeping it out also stops
+# a second lockfile (apps/web/package-lock.json) from confusing `bun install`.
+
+# Never ship host build output or VCS metadata.
+node_modules
+.git
+.gitignore
+
+# Separate image, separate context.
+apps/web
+
+# Secrets: env is injected by compose, never baked into a layer. No exceptions
+# for .env.example either — nothing in the image reads it.
+.env
+.env.*
+*.env
+
+# Vestigial Neon Functions scaffold + the Neon API-key file, neither is imported
+# by server.ts. scripts/ and supabase/ are left out on purpose: schema creation
+# runs from initDb() on every boot, and one-shot migrations are run from a local
+# checkout (`npx tsx scripts/migrate.ts`), not from inside the image.
+neon.ts
+hello.ts
+.neon
+scripts
+supabase
+
+# Deployment + agent config, not needed to serve.
+docker
+docker-compose.yml
+.dockerignore
+.agents
+__pycache__
+metadata.json
+
+# Docs (AGENTS.md is the load-bearing one for agents, but it is not an input to
+# a build).
+*.md
+*.log

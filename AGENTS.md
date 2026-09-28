@@ -200,5 +200,10 @@ in-memory IDs look real and survive restarts.
   `npm run start:web` (Next). A Next-only host serves the app shell and 404s every `/api/*` call —
   the app "loads but all data is broken". A Express-only host answers `/` with its own 404, which is
   correct and expected. If the UI loads and data is broken, check that the API process is actually
-  deployed before debugging the frontend. There is no `vercel.json`/`render.yaml`/`Dockerfile` in the
-  repo — deployment is currently unconfigured and host-specific.
+  deployed before debugging the frontend. Deployment is packaged: `docker compose up -d --build`
+  runs `edge` (nginx:alpine, the only published port, `:80`), which path-splits `/api/*` and
+  `/webhooks/*` to `api` (:3000) and everything else to `web` (:3001); both are exposed, not
+  published. `Dockerfile` (bun install — `bun.lock` is the only root lockfile, so `npm ci` cannot
+  work), `apps/web/Dockerfile` (npm ci + `next build`), `docker/nginx.conf`, `.dockerignore`. The
+  `API_ORIGIN` rewrite origin is a **build** arg as well as a runtime env var, because `rewrites()`
+  is baked into `.next`; changing it requires `--build web`.

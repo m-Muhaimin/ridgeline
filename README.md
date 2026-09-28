@@ -63,7 +63,8 @@ Solo plumbers, electricians, locksmiths, and HVAC technicians face a persistent 
 ## 🏛️ System Architecture
 
 Two processes. The host (or `next.config.ts` in development) routes `/api/*` and `/webhooks/*` to
-Express and everything else to Next.js.
+Express and everything else to Next.js. The shipped compose stack implements exactly that split in
+`edge` — see [Docker Deployment](#5-docker-deployment).
 
 ```
                           ┌──────────────────────────┐
@@ -113,6 +114,9 @@ Express serves no HTML: the only frontend it can emit is a JSON 404 for an unmat
 ├── metadata.json              # Studio project metadata and capabilities
 ├── package.json               # API deps & scripts (the web app has its own)
 ├── bun.lock                   # Committed root lockfile (API deps)
+├── Dockerfile  .dockerignore  # API image (:3000) — bun install --frozen-lockfile, npm start
+├── docker-compose.yml         # edge(:80) + api(:3000) + web(:3001)
+├── docker/nginx.conf          # Public path split: /api/* + /webhooks/* -> api, rest -> web
 ├── server.ts                  # Express API (:3000) — routes, AI pipeline, Neon. No UI.
 ├── packages/                  # domain/ + application/ logic and the 159-test suite
 ├── scripts/                   # migrate.ts, migrate-auth.ts, backfill-booking-instents.ts
@@ -152,7 +156,8 @@ Express serves no HTML: the only frontend it can emit is a JSON 404 for an unmat
 │   │   ├── AIIcon.tsx  EmptyState.tsx  RidgeLineLogo.tsx
 │   │   └── ui/                        # button.tsx, sidebar.tsx
 │   ├── lib/                          # apiFetch.ts, chartUtils.ts, triage.ts, timezones.ts, utils.ts
-│   ├── next.config.ts                # rewrites(): /api/:path* -> http://localhost:3000/api/:path*
+│   ├── next.config.ts                # rewrites(): /api/:path* -> $API_ORIGIN (default http://localhost:3000)
+│   ├── Dockerfile  .dockerignore     # web image — npm ci, next build, next start -p 3001
 │   ├── package.json  tsconfig.json  postcss.config.mjs
 │   ├── mockData.ts                   # in-memory baseline data & fallback state
 │   └── types.ts                      # TypeScript models (Bookings, Threads, Orgs, Users)
@@ -221,6 +226,112 @@ npm start                          # Express API on :3000
 Both processes must run. Route `/api/*` **and** `/webhooks/*` to the Express process and everything
 else to the Next process at the host/reverse-proxy level — the Next rewrite above is a dev
 convenience, and Twilio signature validation needs to reach Express on its real host.
+
+### 5. Docker Deployment
+
+The repo ships a compose stack that does exactly that split for you: three containers, one public
+port. No `vercel.json`/`render.yaml` is involved and no state is stored on disk — the database is
+managed Neon.
+
+| Service | Image | Role | Reachable at |
+|---|---|---|---|
+| `edge` | `nginx:alpine` | public entrypoint, path-splits the origin | `http://localhost` (**host** `:80`) |
+| `api` | root `Dockerfile` | Express API + Twilio webhooks | `api:3000` (internal only) |
+| `web` | `apps/web/Dockerfile` | Next.js UI | `web:3001` (internal only) |
+
+```
+browser ──▶ edge :80 ──┬── /api/*        ──▶ api:3000   (Express)
+                       ├── /webhooks/*   ──▶ api:3000   (Twilio signature validation)
+                       └── /*            ──▶ web:3001   (Next.js)
+```
+
+Only `edge` publishes a port. `:3000` and `:3001` stay on the compose network, which is what keeps
+the "one origin" story true: the browser talks to a single host, the `ridgeline_session` cookie is
+set for that host, and nothing can bypass the rewrite by hitting the API directly.
+
+**Env contract.** `docker compose` reads a `.env` file from the repo root automatically (gitignored
+— copy `.env.example`, fill it in, never commit it). Compose hardcodes no secret; every value is
+interpolated from the environment. Minimum viable production `.env`:
+
+```bash
+APP_URL="https://your-domain.example.com"   # REQUIRED, see below
+
+# Signing secrets — generate with: openssl rand -hex 32
+JWT_SECRET="..."
+SESSION_SECRET="..."
+COOKIE_SECRET="..."
+
+# Managed Postgres. Unset => nothing persists and every route serves mock data.
+DATABASE_URL="postgresql://user:your_password@your-host/neondb?sslmode=require"
+
+# Twilio. Unset => nothing is sent and signature checks are skipped in non-production.
+TWILIO_ACCOUNT_SID="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+TWILIO_AUTH_TOKEN="..."
+TWILIO_PHONE_NUMBER="+15557824309"
+
+# At least one LLM path, else the assistant degrades to a rule-based responder.
+OPENAI_COMPATIBLE_BASE_URL="https://your-gateway-address.example.com/v1"
+OPENAI_COMPATIBLE_API_KEY="..."
+OPENAI_COMPATIBLE_MODEL="gemini/gemini-3.8-flash"
+GEMINI_API_KEY="..."
+```
+
+`APP_URL` is **required** and must be the exact public origin (scheme + host + port, no trailing
+slash). It is rebuilt into the URL Twilio signed, so a mismatch makes every webhook fail signature
+validation with a 403; it also seeds the same-origin allow-list for state-changing `/api` calls.
+Compose will not tell you it is missing — check the boot log and `/api/health`.
+
+Optional: `ALLOWED_ORIGINS` (extra browser origins), `WEB_API_ORIGIN` (only if the API is not the
+`api` service), `NODE_ENV=development` (see the TLS caveat below), and the `NEON_*`/`AWS_*` pair
+behind `/api/neon/*`.
+
+**Build and run:**
+
+```bash
+docker compose up -d --build     # first build pulls node:22-slim + nginx:alpine and runs npm ci twice
+docker compose ps                # every service should reach (healthy)
+docker compose logs -f edge      # one line per request, with which upstream served it
+docker compose down              # tear down (no volumes to clean up)
+```
+
+**Health checks:**
+
+```bash
+docker compose ps                                        # (healthy) per service
+curl -s http://localhost/healthz                         # edge itself
+curl -s http://localhost/api/health                      # API process (reports which integrations are configured)
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/ # web process, 200
+```
+
+`/api/health` is the one that matters: it is unauthenticated, never touches Postgres, and tells you
+which of Gemini / the OpenAI-compatible gateway / Neon are actually configured — which is the only
+way to tell a real deployment from the silent mock fallback.
+
+**Operational notes**
+
+- **Images**: multi-stage, `node:22-slim`, and both processes run as an unprivileged uid 1001 with
+  no shell and no login home. The API additionally runs with a read-only root filesystem and
+  `no-new-privileges` (it writes nothing but npm's cache in a tmpfs); the web container keeps a
+  writable `.next` because Next caches at runtime. The API image is built with
+  `bun install --frozen-lockfile` because `bun.lock` is the only root lockfile — `npm ci` cannot work
+  without a `package-lock.json` the repo deliberately does not have. The web image uses `npm ci`
+  against `apps/web/package-lock.json` and builds with `next build`. Both start with the same
+  commands as local dev (`npm start` / `npm run start`), i.e. npm + tsx/next, unchanged.
+- **No volumes**: no app state is persisted anywhere — the database is managed Neon. Container logs
+  are capped at 3 × 10 MB so a long-running host cannot fill its disk.
+- **TLS**: the stack is plain HTTP on `:80`. In `NODE_ENV=production` the session cookie is issued
+  `Secure; SameSite=None`, which a browser will not store over plain HTTP — so put a TLS terminator
+  in front of `edge` (or bind 443 with certs) for any real deployment. For a quick local trial on
+  plain HTTP, set `NODE_ENV=development` in `.env`; that also re-enables the Twilio signature
+  bypass, so never use it for anything reachable from the internet.
+- **Migrations**: `initDb()` creates the schema on every boot, so there is nothing to run first. The
+  one-off scripts (`scripts/migrate.ts`, `migrate-auth.ts`, `backfill-booking-instents.ts`) are not
+  in the images — run them from a local checkout with `npx tsx scripts/migrate.ts`.
+- **Upgrades**: `API_ORIGIN` is a *build* argument as well as a runtime env var, because Next bakes
+  `rewrites()` into `.next` at build time. If you change it, rebuild:
+  `docker compose up -d --build web`.
+- **Debugging a service**: `docker compose exec api sh` is unavailable (no shell) — use
+  `docker compose exec api node -e "..."` or `docker compose logs -f api`.
 
 ---
 

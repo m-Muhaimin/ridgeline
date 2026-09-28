@@ -1,0 +1,16 @@
+# Build context for the web image only (docker-compose.yml -> context: ./apps/web).
+
+node_modules
+.next
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# Secrets are injected by compose. tsconfig.tsbuildinfo is local incremental
+# state and can make the copied tree disagree with the image's own build.
+.env
+.env.*
+*.env
+tsconfig.tsbuildinfo
+*.log
