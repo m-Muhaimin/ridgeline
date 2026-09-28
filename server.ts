@@ -23,6 +23,8 @@ import {
   type BusyInterval,
   type Interval,
 } from './packages/domain/scheduling/index.js';
+import { decide, isWriteAction } from './packages/domain/conversations/policy-engine.js';
+import { detectEmergency } from './packages/domain/safety/triage.js';
 
 // Load both .env.local and .env
 dotenv.config({ path: '.env.local' });
@@ -877,6 +879,25 @@ async function createBookingChecked(client: PoolClient, orgId: string, input: Cr
  * timestamps in step with scheduled_date / time_slot. A reschedule that
  * would collide is rejected rather than silently double-booking.
  */
+/**
+ * Cancellation stops the next visit; it does not rewrite history. A job already
+ * under way is deliberately left alone: that is a refund conversation, and
+ * quietly marking a technician's completed work "cancelled" would hide it.
+ */
+async function cancelThreadBookings(client: PoolClient, orgId: string, threadId: string): Promise<number> {
+  const res = await client.query(
+    `UPDATE public.job_bookings
+        SET status = 'cancelled',
+            notes = CASE WHEN COALESCE(notes, '') = ''
+                         THEN 'Cancelled by customer via SMS.'
+                         ELSE notes || ' | Cancelled by customer via SMS.' END
+      WHERE organization_id = $1 AND sms_thread_id = $2 AND status = 'scheduled'
+      RETURNING id;`,
+    [orgId, threadId],
+  );
+  return res.rows?.length || 0;
+}
+
 async function rescheduleThreadBookings(
   client: PoolClient,
   orgId: string,
@@ -2880,12 +2901,15 @@ You MUST return a JSON object with the following schema:
     let estimatedPrice = 250;
     let serviceTitle = 'General Service Diagnostic';
 
-    if (lower.includes('flood') || lower.includes('burst') || lower.includes('leak') || lower.includes('sewage') || lower.includes('emergency')) {
+    // One triage rule, shared with the browser. It reads the organization's own
+    // emergency keywords and answers with the right safety instruction: a gas
+    // leak is told to leave, not to go hunting for a valve.
+    const triage = detectEmergency(incomingText, settings.emergencyKeywords);
+    if (triage.isEmergency) {
       intent = 'emergency';
       urgency = 'emergency';
       actionTag = 'emergency_escalated';
-      replyText = `Understood, this is urgent! Please locate and shut off the main water shutoff valve clockwise immediately. ${techName} has openings today - what is your street address, and when suits you?`;
-      actionTag = 'slot_offered';
+      replyText = `${triage.guidance} ${techName} will get on this as fast as possible - what is your street address?`;
       estimatedPrice = 380;
       serviceTitle = 'Emergency Burst Pipe & Valve Shutoff';
     } else if (lower.includes('reschedule') || lower.includes('push to') || lower.includes('move to') || lower.includes('another day') || lower.includes('can we do')) {
@@ -3120,13 +3144,17 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
         let policy: SchedulingPolicy | null = null;
         let resolved: ResolvedSlot | null = null;
         let offers: SlotOffer[] = [];
-        const wantsSlot =
-          assistantResult.shouldConfirmBooking ||
-          assistantResult.intent === 'book' ||
-          assistantResult.intent === 'confirm' ||
-          assistantResult.intent === 'reschedule';
 
-        if (wantsSlot) {
+        const activeRes = await client.query(
+          `SELECT 1 FROM public.job_bookings
+            WHERE sms_thread_id = $1 AND status = ANY($2::booking_status[]) LIMIT 1;`,
+          [threadId, ['scheduled', 'en_route', 'in_progress']],
+        );
+        const hasExistingBooking = (activeRes.rows?.length || 0) > 0;
+
+        // Resolve what the customer actually said BEFORE deciding anything: the
+        // policy engine takes a verified fact, not the model's opinion.
+        if (assistantResult.intent !== 'inquiry' || assistantResult.requestedSlot) {
           policy = await loadSchedulingPolicy(client, orgId);
           const durationMinutes = resolveServiceDuration(assistantResult.serviceTitle, services);
           const resolution = await resolveRequestedSlot(
@@ -3138,20 +3166,39 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
           );
           resolved = resolution.match;
           offers = resolution.offers;
-          if (!resolved && offers.length > 0) {
-            // Nothing bookable yet: show the customer what is actually open.
-            replyText = composeOfferReply(offers, policy.timeZone);
-            threadStatus = 'active';
-          }
         }
 
-        if (resolved) {
+        const decision = decide({
+          intent: assistantResult.intent,
+          urgency: assistantResult.urgency,
+          serviceIdentified: !!(assistantResult.serviceTitle && assistantResult.serviceTitle !== 'General Service Diagnostic'),
+          addressKnown: !!(assistantResult.extractedAddress || customerAddress),
+          requestedSlot: assistantResult.requestedSlot,
+          slotResolution: resolved ? 'available' : assistantResult.requestedSlot ? 'unavailable' : 'unstated',
+          autoConfirmEnabled: settings.autoConfirmRoutine !== false,
+          hasExistingBooking,
+        });
+        if (decision.requiresHuman) {
+          console.log(`[policy] ${decision.action}: ${decision.reason} (thread ${threadId})`);
+        }
+
+        if (!decision.mayWrite && offers.length > 0) {
+          // Nothing bookable yet: show the customer what is actually open.
+          replyText = composeOfferReply(offers, policy!.timeZone);
+          threadStatus = 'active';
+        }
+
+        if (decision.mayWrite && isWriteAction(decision.action) && (resolved || decision.action === 'cancel')) {
           // A savepoint lets a constraint violation be caught without
           // aborting the whole transaction.
           await client.query('SAVEPOINT sched');
           try {
-            if (assistantResult.intent === 'reschedule') {
-              await rescheduleThreadBookings(client, orgId, threadId, resolved.date, resolved.timeSlot);
+            if (decision.action === 'cancel') {
+              await cancelThreadBookings(client, orgId, threadId);
+              replyText = 'Your booking is cancelled. Sorry to see you go - we will be here when you need us.';
+            } else if (decision.action === 'reschedule') {
+              await rescheduleThreadBookings(client, orgId, threadId, resolved!.date, resolved!.timeSlot);
+              replyText = `Moved. You're booked for ${resolved!.label} on ${resolved!.date}. You'll get a text when the technician is on the way.`;
             } else {
               const booking = await createBookingChecked(client, orgId, {
                 customerName,
@@ -3159,8 +3206,8 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
                 address: assistantResult.extractedAddress || customerAddress || 'Address requested via SMS',
                 tradeType: org.trade || 'plumbing',
                 serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
-                date: resolved.date,
-                timeSlot: resolved.timeSlot,
+                date: resolved!.date,
+                timeSlot: resolved!.timeSlot,
                 status: 'scheduled',
                 estimateAmount: assistantResult.estimatedPrice || 250,
                 notes: 'Auto-confirmed by RidgeLine AI Assistant via live Twilio SMS webhook.',
@@ -3169,8 +3216,8 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
                 smsThreadId: threadId,
               });
               bookingId = booking.id;
+              replyText = `You're booked! ${resolved!.label} on ${resolved!.date}. You'll get a text when the technician is on the way.`;
             }
-            replyText = `You're booked! ${resolved.label} on ${resolved.date}. You'll get a text when the technician is on the way.`;
             await client.query('RELEASE SAVEPOINT sched');
           } catch (bookingErr: any) {
             await client.query('ROLLBACK TO SAVEPOINT sched');
@@ -3192,6 +3239,7 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
           [threadId, replyText, assistantResult.actionTag, JSON.stringify(assistantResult)],
         );
 
+        if (decision.action === 'cancel' && decision.mayWrite) threadStatus = 'booked';
         await client.query(
           'UPDATE public.sms_threads SET last_activity_at = NOW(), status = $1 WHERE id = $2;',
           [threadStatus, threadId],

@@ -992,14 +992,24 @@ Time saved per operator
 ```text
 [ ] Extract booking service
 [ ] Extract conversation service
-[ ] Extract policy engine
-[ ] Extract safety engine
+[x] Extract policy engine
+[x] Extract safety engine
 [ ] Extract tenant context
 [ ] Reduce server.ts
-[ ] Remove frontend business duplication
+[~] Remove frontend business duplication
 ```
 
 **Exit condition:** booking/conversation rules exist in one authoritative domain layer.
+
+> **Partial.** The policy engine (2.4) and the safety engine (Phase 4) are now
+> pure, tested modules that both the server and the browser call, so the booking
+> gate is no longer an `if` chain and the emergency rules no longer exist twice.
+> The booking and conversation services (2.2, 2.3) are still methods on
+> `server.ts`, and tenant context (2.5) is still the inlined
+> `runTenantQuery`. `server.ts` is not yet smaller; it grew, because the rules
+> it used to carry by hand are now named and tested. Frontend duplication is
+> down, not gone: availability and emergency triage are shared, the rest of the
+> business logic still lives in `App.tsx`.
 
 ---
 

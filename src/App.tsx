@@ -41,6 +41,7 @@ import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-
 import { AuthPage } from './pages/AuthPage';
 import { OnboardingPage } from './pages/OnboardingPage';
 import { AIIcon } from './components/AIIcon';
+import { detectEmergency } from '../packages/domain/safety/triage';
 
 // Protected Route Component
 const ProtectedRoute = ({ children, user, isLoading }: { children: React.ReactNode, user: User | null, isLoading: boolean }) => {
@@ -318,8 +319,11 @@ export default function App() {
 
       // With no backend there is no availability source, so this fallback may
       // not name a time. It asks, and the real openings come from the server.
-      if (lower.includes('flood') || lower.includes('burst') || lower.includes('leak') || lower.includes('emergency')) {
-        replyText = `Urgent alert: Please shut off your main water valve clockwise! ${techName} has openings today - what is your street address, and when suits you?`;
+      // The emergency rules are the same ones the server uses, so an offline
+      // preview never contradicts the live reply.
+      const triage = detectEmergency(incomingText, settings.emergencyKeywords);
+      if (triage.isEmergency) {
+        replyText = `${triage.guidance} ${techName} will get on this as fast as possible - what is your street address?`;
         actionTag = 'emergency_escalated';
       } else if (lower.includes('reschedule') || lower.includes('push') || lower.includes('can we do')) {
         replyText = `No problem! I can move that - tell me which time works and I'll update ${techName}'s calendar.`;
