@@ -65,7 +65,7 @@ apps/web/          Next.js App Router frontend (own package.json, own tsconfig, 
 packages/          domain/application/server logic + the whole test suite
 scripts/           migrate.ts, migrate-auth.ts, backfill-booking-instents.ts (not in package.json)
 supabase/migrations/  20260927000000_init_ridgeline_schema.sql
-neon.ts + hello.ts + .neon/  vestigial Neon Functions scaffold — don't build on it
+neon.ts + hello.ts + .neon   vestigial Neon Functions scaffold (a file, not a dir) — don't build on it
 ```
 
 - **`server.ts` and `apps/web/` are fully decoupled — no shared types.** `server.ts` imports nothing
@@ -123,6 +123,11 @@ in-memory IDs look real and survive restarts.
 - Env loading is `dotenv.config({path:'.env.local'})` then `dotenv.config()` — **relative paths, so
   cwd must be the repo root.** `.env.local` wins (dotenv doesn't override). `.gitignore` covers
   `.env*` except `.env.example`.
+- **The root `package-lock.json` was removed (2026-09); `bun.lock` is the only root lockfile.** A bare
+  `npm install` at the root regenerates a competing `package-lock.json` next to it. Keep the
+  `--legacy-peer-deps` habit for the root install, and prefer `bun install` to sync root deps (needs
+  bun on PATH — `npm install -g bun` if missing). `apps/web/package-lock.json` is a separate,
+  intentional install and is expected to exist.
 
 ## Auth
 
@@ -130,8 +135,10 @@ in-memory IDs look real and survive restarts.
   web app mirrors the token into `localStorage.ridgeline_session_token` and sends it as a Bearer
   header alongside `credentials: 'include'`. Both paths are live — keep them working.
 - Passwords: PBKDF2-SHA512, 1000 iterations, 16-byte salt, stored as `salt:hash`.
-- `JWT_SECRET` / `SESSION_SECRET` / `COOKIE_SECRET` are **absent from `.env.example`** and fall
-  back to hardcoded constants — one of which is literally named `...-production`. Always set them.
+- `JWT_SECRET` / `SESSION_SECRET` / `COOKIE_SECRET` are **listed in `.env.example` as placeholders**
+  and must be set to long random values (e.g. `openssl rand -hex 32`) in any shared or deployed
+  environment. When they are unset the server still falls back to hardcoded constants — one of which
+  is literally named `...-production` — so never rely on the fallback.
 - Unauthenticated routes (no `requireAuth` middleware): `/api/auth/register`, `/api/auth/login`,
   `/api/auth/logout`, `/api/auth/me` (does its own cookie/Bearer check and answers
   `{ user: null }` rather than 401), `/api/health`, `/api/neon/status`,
@@ -171,10 +178,13 @@ in-memory IDs look real and survive restarts.
 
 ## Known drift
 
-- `README.md`'s project tree omits `scripts/`, `packages/`, `neon.ts`, `hello.ts`, and `.neon/`.
-  Trust the code, not the tree.
-- `README.md`'s "Environment Configuration" section publishes live-looking API credentials.
-  Don't paste them into `.env`, docs, or commits.
+- `README.md`'s project tree is accurate about `scripts/` and `packages/` now that the Next.js
+  migration landed, but it still omits the vestigial scaffold (`neon.ts`, `hello.ts`, `.neon`) and
+  the `PRD.md` / `IMPLEMENTATION.md` docs. Trust the code, not the tree.
+- `README.md`, `.env.example`, and code carry neutral placeholder values only. If you see a live-looking
+  host, URL, or ID in a doc/env file, it was re-introduced — remove it and use a placeholder. That
+  includes defaults baked into code (`ai-pipeline.ts`, `mockData.ts`, `server.ts`): no live
+  third-party host may be a functional default.
 - **The old `/api/neon/execute-sql` and `/api/ai/test-endpoint` routes no longer exist.** Both were
   removed when the SSRF/caller-supplied-SQL surface was closed; `rg "execute-sql|test-endpoint"
   server.ts` returns only comments referring to the route that "used to" exist. The unauthenticated
@@ -182,9 +192,10 @@ in-memory IDs look real and survive restarts.
   longer a safe precedent to copy.
 - `apps/web/components/DataProvider.tsx` seeds every collection from `apps/web/mockData.ts` and then
   overwrites from `/api/neon/data`. There are two sources of truth for each list during startup.
-- `apps/web/components/DataProvider.tsx:29` still describes itself as the orchestrator half of a
-  port of a now-deleted single-page orchestrator — a leftover comment pointing at a file that no
-  longer exists. Harmless, but it will confuse anyone grepping for a root `src/`.
+- `apps/web/components/DataProvider.tsx` still carries inline `// App.tsx:NN` line-number annotations
+  referring to the deleted single-page orchestrator. Its file header no longer does — that now
+  describes the provider accurately — but the annotations are stale references. Harmless, but don't
+  grep for `src/` to find them.
 - **Two processes, not one.** The host must run **both** `npm start` (Express) and
   `npm run start:web` (Next). A Next-only host serves the app shell and 404s every `/api/*` call —
   the app "loads but all data is broken". A Express-only host answers `/` with its own 404, which is

@@ -1133,12 +1133,12 @@ app.get('/api/neon/status', async (req: Request, res: Response) => {
   res.json({
     connected,
     latencyMs,
-    projectId: 'frosty-frog-53077141',
+    projectId: process.env.NEON_PROJECT_ID || 'your-neon-project-id',
     branch: process.env.NEON_BRANCH || 'production',
     region: process.env.AWS_REGION || 'aws-us-east-2',
     pgVersion,
-    functionUrl: process.env.NEON_FUNCTION_API_BASE_URL || 'https://br-wandering-morning-b5ynvzm6-api.compute.c-7.us-east-2.aws.neon.tech',
-    s3Endpoint: process.env.AWS_ENDPOINT_URL_S3 || 'https://br-wandering-morning-b5ynvzm6.storage.c-7.us-east-2.aws.neon.tech',
+    functionUrl: process.env.NEON_FUNCTION_API_BASE_URL || '',
+    s3Endpoint: process.env.AWS_ENDPOINT_URL_S3 || '',
     s3Bucket: 'uploads',
     counts,
     timestamp: new Date().toISOString(),
@@ -1147,7 +1147,7 @@ app.get('/api/neon/status', async (req: Request, res: Response) => {
 
 // Test live Neon Serverless Function
 app.get('/api/neon/test-function', async (req: Request, res: Response) => {
-  const functionUrl = process.env.NEON_FUNCTION_API_BASE_URL || 'https://br-wandering-morning-b5ynvzm6-api.compute.c-7.us-east-2.aws.neon.tech';
+  const functionUrl = process.env.NEON_FUNCTION_API_BASE_URL || '';
   const start = Date.now();
   try {
     const response = await fetch(functionUrl, { method: 'GET' });

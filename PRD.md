@@ -79,7 +79,7 @@ By intercepting missed calls with instantaneous AI textbacks and holding natural
   - `Urgent`: No hot water, clogged primary toilet.
   - `Routine`: Fixture installs, panel upgrades, maintenance quotes.
 - **AI Gateway & LLM Engine Flexibility**:
-  - Native OpenAI-compatible `/chat/completions` endpoint support (e.g. 9router, LiteLLM, vLLM, Ollama).
+  - Native OpenAI-compatible `/chat/completions` endpoint support (e.g. LiteLLM, vLLM, Ollama).
   - Configurable Base URL, Bearer API Key, and Model (default: `gemini/gemini-3.8-flash`).
   - Automatic fallback between OpenAI-compatible gateway, direct Gemini SDK, and deterministic rule-based engines.
 - **Auto-Confirm Rules**: Configurable toggle allowing auto-confirmation of routine jobs without manual owner review.

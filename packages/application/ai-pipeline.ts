@@ -21,8 +21,15 @@ Your job:
    - Offer the new slot and confirm update.
 5. Tone: Short, helpful text messages (1 to 3 sentences max, suitable for SMS). Keep sentences crisp. Never write long multi-paragraph essays.`;
 
-// Default OpenAI-compatible endpoint settings (e.g. 9router, LiteLLM, vLLM, Ollama)
-export const DEFAULT_OPENAI_BASE_URL = process.env.OPENAI_COMPATIBLE_BASE_URL || 'https://9router-production-a99a.up.railway.app/v1';
+// Default OpenAI-compatible endpoint settings (e.g. LiteLLM, vLLM, Ollama).
+// Env-driven, and the fallback is deliberately the RFC 2606 `.invalid` TLD,
+// which is guaranteed never to resolve. It must NOT be a real host: a hardcoded
+// default silently ships every LLM call to a third party for any deployment
+// that forgot to set the var. Because the fallback is always a non-empty string,
+// "no URL configured" is unrepresentable, and the tier is gated on the API key
+// in `callOpenAiCompatibleChat` - so this placeholder can never be dialled with
+// a real key unless OPENAI_COMPATIBLE_BASE_URL is set.
+export const DEFAULT_OPENAI_BASE_URL = process.env.OPENAI_COMPATIBLE_BASE_URL || 'https://openai-compatible.invalid/v1';
 // Empty-string (not undefined) so the truthiness-based provider-selection chain
 // below degrades cleanly to Gemini and then the deterministic responder when
 // OPENAI_COMPATIBLE_API_KEY is unset, instead of attempting a request with a

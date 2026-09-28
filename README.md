@@ -177,8 +177,8 @@ cp .env.example .env
 
 Ensure the following variables are defined:
 ```ini
-# OpenAI-Compatible AI Gateway Settings (e.g. 9router, vLLM, LiteLLM, Ollama)
-OPENAI_COMPATIBLE_BASE_URL="https://9router-production-a99a.up.railway.app/v1"
+# OpenAI-Compatible AI Gateway Settings (e.g. vLLM, LiteLLM, Ollama)
+OPENAI_COMPATIBLE_BASE_URL="https://your-gateway-address.example.com/v1"
 OPENAI_COMPATIBLE_API_KEY="your_openai_compatible_api_key"
 OPENAI_COMPATIBLE_MODEL="gemini/gemini-3.8-flash"
 

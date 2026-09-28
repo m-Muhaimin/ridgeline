@@ -52,7 +52,7 @@ export const initialSettings: AssistantSettings = {
   },
   emergencyKeywords: ['flood', 'burst pipe', 'sewage', 'sparking', 'no heat', 'carbon monoxide', 'water main'],
   llmProvider: 'openai_compatible',
-  openaiBaseUrl: 'https://9router-production-a99a.up.railway.app/v1',
+  openaiBaseUrl: '',
   openaiApiKey: '',
   openaiModel: 'gemini/gemini-3.8-flash',
 };

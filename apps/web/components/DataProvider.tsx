@@ -26,17 +26,13 @@ import { apiFetch } from '../lib/apiFetch';
 import { detectEmergency } from '../lib/triage';
 
 /**
- * The orchestrator half of the port of `src/App.tsx`.
+ * Cross-view data context. Every view page reads its data and mutates it
+ * through `useData()`; the dashboard routes under `app/` all render inside
+ * this provider, so there is no per-view fetching.
  *
- * This file is the contract for Sprint 4 tasks 4-9: every view page reads its
- * data and its mutations from `useData()`. Names, argument order and return
- * types are frozen here. `App.tsx` had all of this inline in one component
- * with the views selected by an `activeTab` string; the only structural change
- * is that navigation is now the URL, so `openThread` / `openThreadForPhone`
- * push `/sms` instead of setting state that nothing outside App.tsx could see.
- *
- * State values, seeds and the shape of every handler are a move, not a
- * redesign - see the line numbers in App.tsx next to each block.
+ * Each collection is seeded from `../mockData` on mount and then overwritten
+ * from `/api/neon/data`, which means there are two sources of truth for every
+ * list until that fetch resolves.
  */
 
 export type TradespersonStatus = 'on_call' | 'available' | 'driving';
