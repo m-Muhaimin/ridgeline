@@ -1,12 +1,15 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Calendar, User, Phone, MapPin, DollarSign, Clock } from 'lucide-react';
 import { JobBooking, TradeType, TradeService } from '../types';
+import { apiFetch } from '../lib/apiFetch';
 
 interface NewBookingModalProps {
   isOpen: boolean;
   onClose: () => void;
   onAddBooking: (booking: Omit<JobBooking, 'id' | 'createdAt'>) => void;
   services: TradeService[];
+  /** Organization zone, so "today" matches the shop's day, not the browser's. */
+  timeZone?: string;
 }
 
 export const NewBookingModal: React.FC<NewBookingModalProps> = ({
@@ -14,18 +17,49 @@ export const NewBookingModal: React.FC<NewBookingModalProps> = ({
   onClose,
   onAddBooking,
   services,
+  timeZone = 'UTC',
 }) => {
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('+1 (555) ');
   const [address, setAddress] = useState('');
   const [selectedServiceId, setSelectedServiceId] = useState(services[0]?.id || '');
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
-  const [timeSlot, setTimeSlot] = useState('09:00 AM - 11:00 AM');
+  const todayInZone = () =>
+    new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const [date, setDate] = useState(todayInZone());
+  // Real openings for the chosen day, fetched from the scheduling engine. An
+  // empty list is a legitimate answer: the day may be fully booked.
+  const [openSlots, setOpenSlots] = useState<Array<{ label: string }>>([]);
+  const [slotsLoading, setSlotsLoading] = useState(false);
+  const [timeSlot, setTimeSlot] = useState('');
   const [estimateAmount, setEstimateAmount] = useState<number>(250);
   const [urgency, setUrgency] = useState<'routine' | 'urgent' | 'emergency'>('routine');
   const [notes, setNotes] = useState('');
 
   if (!isOpen) return null;
+
+  useEffect(() => {
+    if (!isOpen || !date) return;
+    let cancelled = false;
+    const service = services.find(sv => sv.id === selectedServiceId);
+    const qs = new URLSearchParams({ date, limit: '24' });
+    if (service?.title) qs.set('service', service.title);
+    setSlotsLoading(true);
+    apiFetch(`/api/availability?${qs.toString()}`)
+      .then((data: any) => {
+        if (cancelled) return;
+        const offers = data.offers || [];
+        setOpenSlots(offers);
+        setTimeSlot(offers[0]?.label || '');
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn('Availability lookup failed', err);
+        setOpenSlots([]);
+        setTimeSlot('');
+      })
+      .finally(() => { if (!cancelled) setSlotsLoading(false); });
+    return () => { cancelled = true; };
+  }, [isOpen, date, selectedServiceId, services]);
 
   const handleServiceChange = (id: string) => {
     setSelectedServiceId(id);
@@ -38,6 +72,7 @@ export const NewBookingModal: React.FC<NewBookingModalProps> = ({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerName.trim() || !customerPhone.trim()) return;
+    if (!timeSlot) return; // nothing real to book; the server would reject it anyway
 
     const matchedService = services.find(s => s.id === selectedServiceId);
 
@@ -143,17 +178,30 @@ export const NewBookingModal: React.FC<NewBookingModalProps> = ({
             </div>
 
             <div>
-              <label className="block font-medium text-neutral-700 mb-1">Time Slot Window</label>
+              <label className="block font-medium text-neutral-700 mb-1">
+                Time Slot Window
+                <span className="ml-2 text-xs font-normal text-neutral-500">
+                  {slotsLoading ? 'checking availability...' : `${openSlots.length} open`}
+                </span>
+              </label>
               <select
                 value={timeSlot}
                 onChange={(e) => setTimeSlot(e.target.value)}
-                className="w-full bg-neutral-50 border border-neutral-200 rounded px-3 py-1.5 focus:bg-white"
+                disabled={slotsLoading || openSlots.length === 0}
+                className="w-full bg-neutral-50 border border-neutral-200 rounded px-3 py-1.5 focus:bg-white disabled:opacity-60"
               >
-                <option value="08:30 AM - 10:30 AM">08:30 AM - 10:30 AM</option>
-                <option value="11:00 AM - 01:00 PM">11:00 AM - 01:00 PM</option>
-                <option value="01:30 PM - 03:30 PM">01:30 PM - 03:30 PM</option>
-                <option value="04:00 PM - 06:00 PM">04:00 PM - 06:00 PM</option>
+                {openSlots.length === 0 && (
+                  <option value="">{slotsLoading ? 'Loading...' : 'No open slots on this day'}</option>
+                )}
+                {openSlots.map((slot, i) => (
+                  <option key={`${slot.label}-${i}`} value={slot.label}>{slot.label}</option>
+                ))}
               </select>
+              {openSlots.length === 0 && !slotsLoading && (
+                <p className="mt-1 text-xs text-neutral-500">
+                  Working hours, existing bookings and the buffer are all applied. Pick another day.
+                </p>
+              )}
             </div>
 
             <div>

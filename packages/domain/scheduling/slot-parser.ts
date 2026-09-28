@@ -1,4 +1,4 @@
-import type { Interval } from './timezone.js';
+import { zonedParts, type Interval } from './timezone.js';
 
 /**
  * Parses the legacy `job_bookings.time_slot` free-text column.
@@ -67,13 +67,24 @@ export function minutesToLabel(minutes: number): string {
   return `${display}:${mm} ${meridiem}`;
 }
 
-/** Canonical, human-readable label for a confirmed interval. */
-export function intervalLabel(interval: Interval): string {
-  return `${minutesToLabel(localMinutes(interval.start))} - ${minutesToLabel(localMinutes(interval.end))}`;
+/**
+ * Canonical, human-readable label for a confirmed interval, rendered in the
+ * organization's own zone.
+ *
+ * The zone is required rather than defaulted: reading the clock off a UTC
+ * instant labels every booking in the wrong timezone, which for a New York
+ * shop is four hours off -- the exact confusion this engine exists to remove.
+ */
+export function intervalLabel(interval: Interval, timeZone: string): string {
+  return (
+    `${minutesToLabel(localMinutes(interval.start, timeZone))} - ` +
+    `${minutesToLabel(localMinutes(interval.end, timeZone))}`
+  );
 }
 
-function localMinutes(d: Date): number {
-  return d.getUTCHours() * 60 + d.getUTCMinutes();
+function localMinutes(d: Date, timeZone: string): number {
+  const p = zonedParts(d, timeZone);
+  return p.hour * 60 + p.minute;
 }
 
 /**

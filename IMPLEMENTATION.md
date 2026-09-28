@@ -161,6 +161,13 @@ The database should make impossible states difficult or impossible.
 
 ## 1.4 Remove hardcoded fallback slots
 
+> **Status: done.** No business path invents a time. The rule-based responder,
+> the SMS pipeline, the in-memory branches, the frontend simulator and the
+> manual booking form all resolve openings through the scheduling engine
+> (`proposeAvailableSlots` / `GET /api/availability`). A time is written only
+> when the customer stated one *and* it passed the conflict check. `mockData.ts`
+> still contains demo slots as UI seed data, which is not booking logic.
+
 Remove assumptions such as:
 
 ```text
@@ -184,6 +191,13 @@ and generate real slots.
 ---
 
 ## 1.5 Separate proposal from confirmation
+
+> **Status: done for the scheduling path.** The assistant returns
+> `requestedSlot` — a time the customer *stated*, never one it chose — and the
+> system resolves that against live availability before writing. With no
+> resolvable interval it offers verified openings and waits. The explicit
+> Policy Engine below is still Phase 2.4; until then intent classification
+> lives in the responder.
 
 The AI should produce:
 
@@ -960,13 +974,13 @@ Time saved per operator
 ## Sprint 1 — Scheduling Core
 
 ```text
-[ ] Convert bookings to real timestamps
-[ ] Build availability engine
-[ ] Build conflict detection
-[ ] Add transactional booking
-[ ] Add database overlap protection
-[ ] Remove hardcoded slots
-[ ] Add scheduling tests
+[x] Convert bookings to real timestamps
+[x] Build availability engine
+[x] Build conflict detection
+[x] Add transactional booking
+[x] Add database overlap protection
+[x] Remove hardcoded slots
+[x] Add scheduling tests
 ```
 
 **Exit condition:** RidgeLine cannot create an overlapping booking through any code path.

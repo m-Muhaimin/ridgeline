@@ -301,7 +301,7 @@ export default function App() {
         shouldConfirmBooking: data.shouldConfirmBooking,
         extractedDetails: {
           serviceTitle: data.serviceTitle,
-          suggestedSlot: data.suggestedSlot,
+          requestedSlot: data.requestedSlot ?? null,
           address: data.extractedAddress || thread?.address,
           price: data.estimatedPrice,
           urgency: data.urgency,
@@ -316,19 +316,19 @@ export default function App() {
       let actionTag: any = 'info_requested';
       let shouldConfirm = false;
 
+      // With no backend there is no availability source, so this fallback may
+      // not name a time. It asks, and the real openings come from the server.
       if (lower.includes('flood') || lower.includes('burst') || lower.includes('leak') || lower.includes('emergency')) {
-        replyText = `Urgent alert: Please shut off your main water valve clockwise! ${techName} has an opening today at 1:30 PM. What is your street address?`;
+        replyText = `Urgent alert: Please shut off your main water valve clockwise! ${techName} has openings today - what is your street address, and when suits you?`;
         actionTag = 'emergency_escalated';
       } else if (lower.includes('reschedule') || lower.includes('push') || lower.includes('can we do')) {
-        replyText = `No problem! I have updated ${techName}'s calendar and moved your appointment to tomorrow from 9:00 AM - 11:00 AM. See you then!`;
-        actionTag = 'rescheduled';
-        shouldConfirm = true;
+        replyText = `No problem! I can move that - tell me which time works and I'll update ${techName}'s calendar.`;
+        actionTag = 'slot_offered';
       } else if (lower.includes('yes') || lower.includes('confirm') || lower.includes('works') || lower.includes('book')) {
-        replyText = `You're all set! We have you confirmed on ${techName}'s dispatch schedule. ${techName} will text when 15 minutes away with the truck.`;
-        actionTag = 'auto_booked';
-        shouldConfirm = true;
+        replyText = `Great - tell me which time works and I'll lock it in on ${techName}'s schedule. ${techName} will text when 15 minutes away with the truck.`;
+        actionTag = 'slot_offered';
       } else if (lower.includes('how much') || lower.includes('cost') || lower.includes('quote')) {
-        replyText = `Our diagnostic & basic service call is $195-$285 depending on parts required. ${techName} has an opening tomorrow morning at 9:00 AM or 1:00 PM if you'd like a slot!`;
+        replyText = `Our diagnostic & basic service call is $195-$285 depending on parts required. Want me to check ${techName}'s openings?`;
         actionTag = 'quote_given';
       }
 
@@ -338,7 +338,7 @@ export default function App() {
         shouldConfirmBooking: shouldConfirm,
         extractedDetails: {
           serviceTitle: 'Main Line Drain Snaking / Hydrojet',
-          suggestedSlot: 'Tomorrow 09:00 AM - 11:00 AM',
+          requestedSlot: null,
           address: thread?.address || '742 Evergreen Terrace',
           price: 285,
           urgency: 'routine',
@@ -430,80 +430,97 @@ export default function App() {
     }));
   };
 
-  // Auto-confirm or reschedule booking from SMS
+  // Auto-confirm or reschedule booking from SMS.
+  //
+  // This never invents a time. A slot is written only when the customer named
+  // one, or when they confirm a real opening from /api/availability. The date
+  // is derived in the organization's zone, not UTC. If the server rejects the
+  // booking we surface that instead of quietly creating a local row, which
+  // used to hide double-bookings from the operator.
   const handleAutoConfirmFromSms = async (thread: SmsThread, details: any) => {
     const isReschedule = details?.intent === 'reschedule';
-    
-    if (isReschedule && thread.bookingId) {
-      const nextDay = new Date(Date.now() + 86400000).toISOString().split('T')[0];
-      const slot = details?.suggestedSlot || '09:00 AM - 11:00 AM';
-      setBookings(prev => prev.map(b => {
-        if (b.id === thread.bookingId) {
-          return {
-            ...b,
-            date: nextDay,
-            timeSlot: slot,
-            notes: `${b.notes} (Rescheduled via SMS)`,
-          };
-        }
-        return b;
-      }));
+    const orgZone = currentOrg?.timezone || 'UTC';
 
-      // Update in Neon
-      fetch(`/api/bookings/${thread.bookingId}`, {
+    const zoneDate = (offsetDays: number) =>
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: orgZone, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date(Date.now() + offsetDays * 86400000));
+
+    let slot: string | null = details?.requestedSlot || null;
+
+    if (!slot) {
+      // Nothing was stated: ask the server what is genuinely open.
+      let offers: Array<{ date: string; label: string }> = [];
+      try {
+        const data = await apiFetch(`/api/availability?service=${encodeURIComponent(details?.serviceTitle || '')}&limit=3`);
+        offers = data.offers || [];
+      } catch (err) {
+        console.warn('Availability lookup failed', err);
+      }
+      if (offers.length === 0) {
+        showToast('No verified opening available - ask the technician to call the customer.');
+        return;
+      }
+      const chosen = offers[0];
+      slot = chosen.label;
+      showToast(`Next real opening for ${thread.customerName}: ${chosen.date} ${chosen.label}`);
+      return; // proposing is not booking: the customer must confirm first
+    }
+
+    if (isReschedule && thread.bookingId) {
+      const nextDay = zoneDate(1);
+      const data = await apiFetch(`/api/bookings/${thread.bookingId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
         body: JSON.stringify({ date: nextDay, timeSlot: slot }),
-      }).catch(e => console.warn(e));
-
+      });
+      if (data.booking) {
+        setBookings(prev => prev.map(b => (b.id === thread.bookingId ? data.booking : b)));
+      } else {
+        setBookings(prev => prev.map(b =>
+          b.id === thread.bookingId ? { ...b, date: nextDay, timeSlot: slot, notes: `${b.notes} (Rescheduled via SMS)` } : b,
+        ));
+      }
       setThreads(prev => prev.map(t => t.id === thread.id ? { ...t, status: 'rescheduled' } : t));
       showToast(`Appointment for ${thread.customerName} was rescheduled via SMS.`);
-    } else {
-      const newBookingData = {
-        customerName: thread.customerName,
-        customerPhone: thread.customerPhone,
-        address: details?.address || thread.address || '312 Elm Street, Springfield',
-        tradeType: thread.tradeType || 'plumbing',
-        serviceTitle: details?.serviceTitle || 'General Service Diagnostic & Repair',
-        date: new Date().toISOString().split('T')[0],
-        timeSlot: details?.suggestedSlot || '01:30 PM - 03:30 PM',
-        status: 'scheduled' as const,
-        estimateAmount: details?.price || 285,
-        notes: `Auto-booked by RidgeLine AI Assistant via SMS thread.`,
-        urgency: details?.urgency || 'routine',
-        createdFrom: 'sms' as const,
-        smsThreadId: thread.id,
-      };
+      return;
+    }
 
-      try {
-        const data = await apiFetch('/api/bookings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify(newBookingData),
-        });
-        if (data.booking) {
-          setBookings(prev => [data.booking, ...prev]);
-          setThreads(prev => prev.map(t => t.id === thread.id ? { ...t, bookingId: data.booking.id, status: 'booked' } : t));
-          showToast(`Job auto-confirmed for ${thread.customerName} & saved to Neon Postgres!`);
-          return;
-        }
-      } catch (err) {
-        console.warn('Neon booking save fallback', err);
+    const newBookingData = {
+      customerName: thread.customerName,
+      customerPhone: thread.customerPhone,
+      address: details?.address || thread.address || '312 Elm Street, Springfield',
+      tradeType: thread.tradeType || 'plumbing',
+      serviceTitle: details?.serviceTitle || 'General Service Diagnostic & Repair',
+      date: zoneDate(0),
+      timeSlot: slot,
+      status: 'scheduled' as const,
+      estimateAmount: details?.price || 285,
+      notes: `Auto-booked by RidgeLine AI Assistant via SMS thread.`,
+      urgency: details?.urgency || 'routine',
+      createdFrom: 'sms' as const,
+      smsThreadId: thread.id,
+    };
+
+    try {
+      const data = await apiFetch('/api/bookings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newBookingData),
+      });
+      if (data.booking) {
+        setBookings(prev => [data.booking, ...prev]);
+        setThreads(prev => prev.map(t => t.id === thread.id ? { ...t, bookingId: data.booking.id, status: 'booked' } : t));
+        showToast(`Job booked for ${thread.customerName} at ${slot} & saved to Neon Postgres!`);
+        return;
       }
-
-      const newBookingId = `bk-${Date.now().toString().slice(-4)}`;
-      const newBooking: JobBooking = {
-        id: newBookingId,
-        organizationId: currentOrg?.id || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-        ...newBookingData,
-        createdAt: new Date().toISOString(),
-      };
-
-      setBookings(prev => [newBooking, ...prev]);
-      setThreads(prev => prev.map(t => t.id === thread.id ? { ...t, bookingId: newBookingId, status: 'booked' } : t));
-      showToast(`New Job auto-confirmed for ${thread.customerName} on dispatch calendar!`);
+      throw new Error('Booking was not created');
+    } catch (err: any) {
+      // 409 SLOT_UNAVAILABLE and 400 UNPARSEABLE_SLOT land here. The schedule
+      // on screen stays truthful: nothing is added locally.
+      console.warn('Booking rejected by server', err);
+      setThreads(prev => prev.map(t => t.id === thread.id ? { ...t, status: 'active' } : t));
+      showToast(err?.message || 'That slot could not be booked.');
     }
   };
 
@@ -1002,6 +1019,7 @@ export default function App() {
         {/* Modals */}
         <NewBookingModal
           isOpen={isNewBookingOpen}
+          timeZone={currentOrg?.timezone || 'UTC'}
           onClose={() => setIsNewBookingOpen(false)}
           onAddBooking={async (newJob) => {
             try {

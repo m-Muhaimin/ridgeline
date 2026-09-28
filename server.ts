@@ -15,6 +15,13 @@ import {
   zonedTimeToUtc,
   zonedParts,
   isValidTimeZone,
+  availableSlots,
+  intervalLabel,
+  stripDayQualifier,
+  generateSlots,
+  type BusinessHours,
+  type BusyInterval,
+  type Interval,
 } from './packages/domain/scheduling/index.js';
 
 // Load both .env.local and .env
@@ -551,22 +558,212 @@ function localDateInZone(timeZone: string, now: Date = new Date()): string {
   return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
 }
 
-type SchedulingPolicy = { timeZone: string; bufferMinutes: number };
+type SchedulingPolicy = {
+  timeZone: string;
+  bufferMinutes: number;
+  businessHours: BusinessHours;
+  workWeekends: boolean;
+  minLeadTimeHours: number;
+};
 
-async function loadSchedulingPolicy(client: PoolClient, orgId: string): Promise<SchedulingPolicy> {
-  const { rows } = await client.query(
+/** A Postgres `TIME` ("07:30:00") as minutes past local midnight. */
+function timeColumnToMinutes(value: unknown): number {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(value ?? ''));
+  return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+}
+
+const DEFAULT_WORK_START_MIN = 7 * 60 + 30;
+const DEFAULT_WORK_END_MIN = 17 * 60 + 30;
+/** Nobody wants a van dispatched for "in 20 minutes", and the plan is unusable
+ *  without a floor. Overridable per organization later. */
+const DEFAULT_MIN_LEAD_HOURS = 2;
+/** Step between candidate starts. */
+const SLOT_STEP_MINUTES = 30;
+const DEFAULT_MAX_ADVANCE_DAYS = 14;
+
+async function loadSchedulingPolicy(
+  db: PoolClient | Pool,
+  orgId: string,
+): Promise<SchedulingPolicy> {
+  const { rows } = await db.query(
     `SELECT o.timezone,
-            COALESCE(s.buffer_minutes_between_jobs, 45) AS buffer_minutes
+            COALESCE(s.buffer_minutes_between_jobs, 45) AS buffer_minutes,
+            s.working_hours_start,
+            s.working_hours_end,
+            COALESCE(s.work_weekends, false) AS work_weekends
        FROM public.organizations o
        LEFT JOIN public.assistant_settings s ON s.organization_id = o.id
       WHERE o.id = $1`,
     [orgId],
   );
   if (rows.length === 0) throw new Error(`Organization ${orgId} not found`);
+  const row = rows[0];
+  const startMin = timeColumnToMinutes(row.working_hours_start);
+  const endMin = timeColumnToMinutes(row.working_hours_end);
+  const startMinute = Number.isFinite(startMin) ? startMin : DEFAULT_WORK_START_MIN;
+  const endMinute = Number.isFinite(endMin) && endMin > startMinute ? endMin : DEFAULT_WORK_END_MIN;
+  const workWeekends = row.work_weekends === true;
+  const perWeekday: Record<number, { startMinute: number; endMinute: number } | null> = {};
+  for (let day = 0; day < 7; day++) {
+    const weekend = day === 0 || day === 6;
+    perWeekday[day] = weekend && !workWeekends ? null : { startMinute, endMinute };
+  }
   return {
-    timeZone: rows[0].timezone || 'UTC',
-    bufferMinutes: Number(rows[0].buffer_minutes) || 0,
+    timeZone: row.timezone || 'UTC',
+    bufferMinutes: Number(row.buffer_minutes) || 0,
+    businessHours: { perWeekday },
+    workWeekends,
+    minLeadTimeHours: DEFAULT_MIN_LEAD_HOURS,
   };
+}
+
+/**
+ * Bookings that occupy the schedule. Mirrors the predicate in the
+ * `job_bookings_no_active_overlap` exclusion constraint, so an offer is never
+ * made for a window the database would then reject.
+ */
+async function loadBusyIntervals(
+  db: PoolClient | Pool,
+  orgId: string,
+): Promise<BusyInterval[]> {
+  const { rows } = await db.query(
+    `SELECT b.scheduled_start, b.scheduled_end, b.customer_name
+       FROM public.job_bookings b
+      WHERE b.organization_id = $1
+        AND b.status = ANY($2::booking_status[])
+        AND b.scheduled_start IS NOT NULL
+        AND b.scheduled_end IS NOT NULL`,
+    [orgId, ['scheduled', 'en_route', 'in_progress']],
+  );
+  return rows.map((r) => ({
+    start: new Date(r.scheduled_start),
+    end: new Date(r.scheduled_end),
+    id: r.customer_name,
+  }));
+}
+
+export type SlotOffer = { interval: Interval; label: string; date: string };
+
+/**
+ * Genuine openings for a service, from real working hours, real bookings and
+ * the real buffer. This is the only thing allowed to produce a time the
+ * assistant may offer or book -- never a hardcoded literal.
+ */
+async function proposeAvailableSlots(
+  db: PoolClient | Pool,
+  orgId: string,
+  opts: { durationMinutes: number; now?: Date; limit?: number; maxAdvanceDays?: number },
+): Promise<SlotOffer[]> {
+  const policy = await loadSchedulingPolicy(db, orgId);
+  const busy = await loadBusyIntervals(db, orgId);
+  const slots = availableSlots({
+    now: opts.now ?? new Date(),
+    timeZone: policy.timeZone,
+    businessHours: policy.businessHours,
+    durationMinutes: opts.durationMinutes,
+    stepMinutes: SLOT_STEP_MINUTES,
+    bufferMinutes: policy.bufferMinutes,
+    busy,
+    minLeadTimeHours: policy.minLeadTimeHours,
+    maxAdvanceDays: opts.maxAdvanceDays ?? DEFAULT_MAX_ADVANCE_DAYS,
+  });
+  return slots.slice(0, opts.limit ?? 3).map((interval) => ({
+    interval,
+    label: intervalLabel(interval, policy.timeZone),
+    date: localDateInZone(policy.timeZone, interval.start),
+  }));
+}
+
+/** Service duration drives slot width; fall back to a typical diagnostic. */
+const DEFAULT_SERVICE_MINUTES = 120;
+
+function resolveServiceDuration(
+  serviceTitle: string | null | undefined,
+  services: Array<{ title?: string; durationHours?: number | string }>,
+): number {
+  if (serviceTitle && services.length) {
+    const want = serviceTitle.toLowerCase();
+    const hit =
+      services.find((sv) => (sv.title || '').toLowerCase() === want) ||
+      services.find((sv) => (sv.title || '').toLowerCase().includes(want) || want.includes((sv.title || '').toLowerCase()));
+    const hours = hit ? Number(hit.durationHours) : NaN;
+    if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60);
+  }
+  return DEFAULT_SERVICE_MINUTES;
+}
+
+/** Is this instant inside the organization's working window for its weekday? */
+function withinBusinessHours(instant: Date, end: Date, policy: SchedulingPolicy): boolean {
+  const p = zonedParts(instant, policy.timeZone);
+  const window = policy.businessHours.perWeekday[p.weekday];
+  if (!window) return false;
+  const startMinute = p.hour * 60 + p.minute;
+  const endMinute = startMinute + Math.round((end.getTime() - instant.getTime()) / 60_000);
+  return startMinute >= window.startMinute && endMinute <= window.endMinute;
+}
+
+export type ResolvedSlot = { date: string; timeSlot: string; label: string; interval: Interval };
+
+/**
+ * Turn a customer-stated time into a real, free, bookable interval.
+ *
+ * Searches forward for the first day the customer could actually have meant,
+ * honouring an explicit "today"/"tomorrow" and the working window. When no day
+ * works, real alternatives are offered instead. There is no branch here that
+ * produces a time nobody asked for.
+ */
+async function resolveRequestedSlot(
+  db: PoolClient | Pool,
+  orgId: string,
+  requestedSlot: string | null,
+  durationMinutes: number,
+  policy: SchedulingPolicy,
+  now: Date = new Date(),
+): Promise<{ match: ResolvedSlot | null; offers: SlotOffer[] }> {
+  const parsed = parseSlotString(requestedSlot);
+  if (!parsed) {
+    return { match: null, offers: await proposeAvailableSlots(db, orgId, { durationMinutes, now }) };
+  }
+  const busy = await loadBusyIntervals(db, orgId);
+  const earliest = now.getTime() + policy.minLeadTimeHours * 3_600_000;
+  // An explicit "tomorrow" must not be satisfied by today.
+  const firstDay = parsed.dayHint === 'tomorrow' ? 1 : 0;
+
+  for (let i = firstDay; i < firstDay + DEFAULT_MAX_ADVANCE_DAYS; i++) {
+    const cursor = new Date(now.getTime() + i * 86_400_000);
+    const date = localDateInZone(policy.timeZone, cursor);
+    const interval = resolveBookingInterval(date, requestedSlot, policy.timeZone);
+    if (!interval) continue;
+    if (interval.start.getTime() < earliest) continue;
+    if (!withinBusinessHours(interval.start, interval.end, policy)) continue;
+    if (findConflicts(interval, busy, policy.bufferMinutes).length > 0) continue;
+    return {
+      match: {
+        date,
+        timeSlot: stripDayQualifier(requestedSlot) || intervalLabel(interval, policy.timeZone),
+        label: intervalLabel(interval, policy.timeZone),
+        interval,
+      },
+      offers: [],
+    };
+  }
+  return { match: null, offers: await proposeAvailableSlots(db, orgId, { durationMinutes, now }) };
+}
+
+/** Human reply built only from openings that already passed the conflict check. */
+function composeOfferReply(offers: SlotOffer[], timeZone: string, lead = 'Which of these suits you'): string {
+  if (offers.length === 0) {
+    return 'I could not find an open slot soon. Let me have the technician call you to find a time.';
+  }
+  const listed = offers
+    .slice(0, 3)
+    .map((o) => {
+      const parts = zonedParts(o.interval.start, timeZone);
+      const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][parts.weekday];
+      return `${day} ${o.label}`;
+    })
+    .join(' | ');
+  return `I can do ${listed}. ${lead}?`;
 }
 
 /**
@@ -1777,6 +1974,68 @@ app.delete('/api/customers/:id', requireAuth, async (req: Request, res: Response
 });
 
 // Create Job Booking in Neon Postgres - Tenant Derived Server-Side
+// Genuine openings, straight from business hours, live bookings and the
+// buffer. Every surface that needs a time should ask here rather than invent
+// one: the assistant, the dispatch board and the SMS simulator all share it.
+app.get('/api/availability', requireAuth, async (req: Request, res: Response) => {
+  if (!pool) return res.status(503).json({ error: 'Availability requires a database connection.' });
+  const orgId = req.user!.organizationId;
+  if (!orgId) return res.status(400).json({ error: 'No organization in session.' });
+  try {
+    const client = await pool.connect();
+    try {
+      const limit = Math.min(Math.max(Number(req.query.limit) || 3, 1), 12);
+      const durationMinutes = Number(req.query.durationMinutes) || 0;
+      const serviceTitle = typeof req.query.service === 'string' ? req.query.service : null;
+
+      let minutes = durationMinutes;
+      if (!minutes && serviceTitle) {
+        const { rows } = await client.query(
+          `SELECT title, duration_hours FROM public.services
+            WHERE organization_id = $1 AND title ILIKE '%' || $2 || '%' LIMIT 1;`,
+          [orgId, serviceTitle],
+        );
+        if (rows.length) minutes = Math.round(Number(rows[0].duration_hours) * 60);
+      }
+
+      const duration = minutes || DEFAULT_SERVICE_MINUTES;
+      const policy = await loadSchedulingPolicy(client, orgId);
+      const wantedDate = typeof req.query.date === 'string' ? req.query.date : null;
+      const m = wantedDate ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(wantedDate) : null;
+
+      let offers: SlotOffer[];
+      if (m) {
+        // A specific day was asked for (the manual booking form). Generate
+        // that day's openings directly rather than the rolling window.
+        const dayStart = zonedTimeToUtc(Number(m[1]), Number(m[2]), Number(m[3]), 0, 0, policy.timeZone);
+        const busy = await loadBusyIntervals(client, orgId);
+        const earliest = Date.now() + policy.minLeadTimeHours * 3_600_000;
+        offers = generateSlots({
+          year: Number(m[1]), month: Number(m[2]), day: Number(m[3]),
+          timeZone: policy.timeZone, businessHours: policy.businessHours,
+          durationMinutes: duration, stepMinutes: SLOT_STEP_MINUTES,
+        })
+          .filter((interval) => interval.start.getTime() >= Math.max(earliest, dayStart.getTime()))
+          .filter((interval) => findConflicts(interval, busy, policy.bufferMinutes).length === 0)
+          .slice(0, limit)
+          .map((interval) => ({
+            interval,
+            label: intervalLabel(interval, policy.timeZone),
+            date: wantedDate!,
+          }));
+      } else {
+        offers = await proposeAvailableSlots(client, orgId, { durationMinutes: duration, limit });
+      }
+      res.json({ timeZone: policy.timeZone, durationMinutes: duration, offers });
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Availability lookup failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
   // Always derive organizationId server-side from session!
   const orgId = req.user!.organizationId;
@@ -1897,7 +2156,7 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
     tradeType,
     serviceTitle,
     date: date || new Date().toISOString().slice(0, 10),
-    timeSlot: timeSlot || '09:00 AM - 11:00 AM',
+    timeSlot,
     status,
     estimateAmount: Number(estimateAmount) || 0,
     notes,
@@ -2461,7 +2720,12 @@ export interface SmsAssistantResult {
   urgency: 'routine' | 'urgent' | 'emergency';
   actionTag: 'auto_booked' | 'rescheduled' | 'quote_given' | 'emergency_escalated' | 'slot_offered' | 'info_requested';
   serviceTitle: string | null;
-  suggestedSlot: string | null;
+  /**
+   * A time the CUSTOMER asked for, verbatim, or null. Never a time the model
+   * chose: a proposed clock time is a scheduling decision, and those come
+   * from business hours plus live bookings, not from a language model.
+   */
+  requestedSlot: string | null;
   extractedAddress: string | null;
   estimatedPrice: number;
   shouldConfirmBooking: boolean;
@@ -2508,7 +2772,7 @@ You MUST return a JSON object with the following schema:
   "urgency": "routine" | "urgent" | "emergency",
   "actionTag": "auto_booked" | "rescheduled" | "quote_given" | "emergency_escalated" | "slot_offered" | "info_requested",
   "serviceTitle": "matched service title or null",
-  "suggestedSlot": "proposed slot or confirmed slot e.g. Tomorrow 09:00 AM - 11:00 AM or null",
+  "requestedSlot": "a time the CUSTOMER explicitly asked for, copied verbatim, or null. NEVER invent, guess or infer a time that was not stated.",
   "extractedAddress": "address extracted from message if any or null",
   "estimatedPrice": number,
   "shouldConfirmBooking": boolean (true if slot explicitly confirmed/booked/rescheduled)
@@ -2571,9 +2835,9 @@ You MUST return a JSON object with the following schema:
                 type: Type.STRING,
                 description: 'Matched trade service title, if determined.',
               },
-              suggestedSlot: {
+              requestedSlot: {
                 type: Type.STRING,
-                description: 'Proposed or confirmed time slot e.g. "Tomorrow 09:00 AM - 11:00 AM"',
+                description: 'A time the customer explicitly asked for, copied verbatim, or null. Never invent a time.',
               },
               extractedAddress: {
                 type: Type.STRING,
@@ -2609,7 +2873,10 @@ You MUST return a JSON object with the following schema:
     const techName = settings.tradespersonName || 'Mark';
     let replyText = `Thanks for reaching out! ${techName} is on a service call. Can you share what issue you're experiencing and your address?`;
     let shouldConfirmBooking = false;
-    let suggestedSlot = 'Tomorrow 10:00 AM - 12:00 PM';
+    // The rule engine classifies intent only. It has no reliable way to tell
+    // whether a customer named a time, and a guessed one gets written straight
+    // into the schedule, so it defers to the scheduling engine.
+    let requestedSlot: string | null = null;
     let estimatedPrice = 250;
     let serviceTitle = 'General Service Diagnostic';
 
@@ -2617,26 +2884,28 @@ You MUST return a JSON object with the following schema:
       intent = 'emergency';
       urgency = 'emergency';
       actionTag = 'emergency_escalated';
-      replyText = `Understood, this is urgent! Please locate and shut off the main water shutoff valve clockwise immediately. ${techName} can dispatch to you today at 1:30 PM. What is your street address?`;
-      suggestedSlot = 'Today 01:30 PM - 03:30 PM';
+      replyText = `Understood, this is urgent! Please locate and shut off the main water shutoff valve clockwise immediately. ${techName} has openings today - what is your street address, and when suits you?`;
+      actionTag = 'slot_offered';
       estimatedPrice = 380;
       serviceTitle = 'Emergency Burst Pipe & Valve Shutoff';
     } else if (lower.includes('reschedule') || lower.includes('push to') || lower.includes('move to') || lower.includes('another day') || lower.includes('can we do')) {
       intent = 'reschedule';
       urgency = 'routine';
-      actionTag = 'rescheduled';
-      shouldConfirmBooking = true;
-      suggestedSlot = 'Tomorrow 09:00 AM - 11:00 AM';
-      replyText = `No problem at all! I have updated ${techName}'s schedule and moved your appointment to tomorrow from 9:00 AM - 11:00 AM. See you then!`;
+      // Offering is not rescheduling. The move happens once the customer
+      // names a real opening, not one the fallback made up.
+      actionTag = 'slot_offered';
+      shouldConfirmBooking = false;
+      replyText = `No problem at all, I can move that. ${techName} has a few openings - which one works for you?`;
     } else if (lower.includes('yes') || lower.includes('sounds good') || lower.includes('perfect') || lower.includes('confirm') || lower.includes('book it')) {
       intent = 'confirm';
-      actionTag = 'auto_booked';
-      shouldConfirmBooking = true;
-      replyText = `You're all set! We have you confirmed on ${techName}'s dispatch schedule for tomorrow 09:00 AM - 11:00 AM. ${techName} will text when en route!`;
+      // "Yes" confirms the last thing offered, not a time invented here.
+      actionTag = 'slot_offered';
+      shouldConfirmBooking = false;
+      replyText = `Great - tell me which time works and I'll lock it in on ${techName}'s schedule.`;
     } else if (lower.includes('how much') || lower.includes('cost') || lower.includes('quote') || lower.includes('price')) {
       intent = 'inquiry';
       actionTag = 'quote_given';
-      replyText = `Our standard diagnostic & basic service call is $195-$285 depending on parts required. ${techName} has an opening tomorrow morning at 9:00 AM or 1:00 PM if you'd like a slot!`;
+      replyText = `Our standard diagnostic & basic service call is $195-$285 depending on parts required. Want me to check ${techName}'s openings for you?`;
     }
 
     parsedResult = {
@@ -2646,7 +2915,7 @@ You MUST return a JSON object with the following schema:
       urgency,
       actionTag,
       serviceTitle,
-      suggestedSlot,
+      requestedSlot,
       extractedAddress: address || '',
       estimatedPrice,
       shouldConfirmBooking,
@@ -2827,7 +3096,9 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
     // reply must never claim a booking that failed to commit, so the booking
     // decision happens before the assistant message is written.
     let replyText = assistantResult.replyText;
-    let threadStatus = assistantResult.shouldConfirmBooking ? 'booked' : 'active';
+    // A thread is only "booked" once an interval is actually written, which is
+    // decided inside the transaction below.
+    let threadStatus = 'active';
     let bookingId: string | null = null;
     const SLOT_UNAVAILABLE_REPLY =
       'Sorry - that time has just been taken. I will ask the technician to call you and find another slot.';
@@ -2843,21 +3114,44 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
           [threadId, body],
         );
 
-        if (assistantResult.shouldConfirmBooking) {
+        // Phase 1.5: intent becomes either a real interval or a list of real
+        // openings -- never a time the language model made up. A booking is
+        // only written once the customer has named an opening we verified.
+        let policy: SchedulingPolicy | null = null;
+        let resolved: ResolvedSlot | null = null;
+        let offers: SlotOffer[] = [];
+        const wantsSlot =
+          assistantResult.shouldConfirmBooking ||
+          assistantResult.intent === 'book' ||
+          assistantResult.intent === 'confirm' ||
+          assistantResult.intent === 'reschedule';
+
+        if (wantsSlot) {
+          policy = await loadSchedulingPolicy(client, orgId);
+          const durationMinutes = resolveServiceDuration(assistantResult.serviceTitle, services);
+          const resolution = await resolveRequestedSlot(
+            client,
+            orgId,
+            assistantResult.requestedSlot,
+            durationMinutes,
+            policy,
+          );
+          resolved = resolution.match;
+          offers = resolution.offers;
+          if (!resolved && offers.length > 0) {
+            // Nothing bookable yet: show the customer what is actually open.
+            replyText = composeOfferReply(offers, policy.timeZone);
+            threadStatus = 'active';
+          }
+        }
+
+        if (resolved) {
           // A savepoint lets a constraint violation be caught without
           // aborting the whole transaction.
           await client.query('SAVEPOINT sched');
           try {
-            const policy = await loadSchedulingPolicy(client, orgId);
             if (assistantResult.intent === 'reschedule') {
-              const nextDate = localDateInZone(policy.timeZone, new Date(Date.now() + 86400000));
-              await rescheduleThreadBookings(
-                client,
-                orgId,
-                threadId,
-                nextDate,
-                assistantResult.suggestedSlot,
-              );
+              await rescheduleThreadBookings(client, orgId, threadId, resolved.date, resolved.timeSlot);
             } else {
               const booking = await createBookingChecked(client, orgId, {
                 customerName,
@@ -2865,8 +3159,8 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
                 address: assistantResult.extractedAddress || customerAddress || 'Address requested via SMS',
                 tradeType: org.trade || 'plumbing',
                 serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
-                date: localDateInZone(policy.timeZone),
-                timeSlot: assistantResult.suggestedSlot,
+                date: resolved.date,
+                timeSlot: resolved.timeSlot,
                 status: 'scheduled',
                 estimateAmount: assistantResult.estimatedPrice || 250,
                 notes: 'Auto-confirmed by RidgeLine AI Assistant via live Twilio SMS webhook.',
@@ -2876,6 +3170,7 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
               });
               bookingId = booking.id;
             }
+            replyText = `You're booked! ${resolved.label} on ${resolved.date}. You'll get a text when the technician is on the way.`;
             await client.query('RELEASE SAVEPOINT sched');
           } catch (bookingErr: any) {
             await client.query('ROLLBACK TO SAVEPOINT sched');
@@ -2934,7 +3229,10 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
         actionTag: assistantResult.actionTag,
       });
 
-      if (assistantResult.shouldConfirmBooking) {
+      // Without a database there is no availability source, so nothing is
+      // written: inventing "01:30 PM - 03:30 PM" here would be the exact bug
+      // the scheduling engine exists to remove.
+      if (assistantResult.requestedSlot) {
         inMemoryBookings.unshift({
           id: `bk-tw-${Date.now().toString().slice(-4)}`,
           organizationId: orgId,
@@ -2943,11 +3241,11 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
           address: assistantResult.extractedAddress || customerAddress || 'Address pending',
           tradeType: org.trade || 'plumbing',
           serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
-          date: new Date().toISOString().split('T')[0],
-          timeSlot: assistantResult.suggestedSlot || '01:30 PM - 03:30 PM',
+          date: localDateInZone(org.timezone || 'UTC'),
+          timeSlot: stripDayQualifier(assistantResult.requestedSlot) || assistantResult.requestedSlot,
           status: 'scheduled',
           estimateAmount: assistantResult.estimatedPrice || 250,
-          notes: 'Auto-confirmed via live Twilio SMS webhook.',
+          notes: 'Recorded via live Twilio SMS webhook (no database: conflict checking unavailable).',
           urgency: assistantResult.urgency || 'routine',
           createdFrom: 'sms',
           smsThreadId: threadId,

@@ -29,13 +29,14 @@ export function generateSlots(input: GenerateSlotsInput): Interval[] {
   const window = businessHours.perWeekday[weekday];
   if (!window) return [];
 
-  const dayStart = zonedTimeToUtc(year, month, day, 0, 0, timeZone);
   const slots: Interval[] = [];
   for (let m = window.startMinute; m + durationMinutes <= window.endMinute; m += step) {
-    slots.push({
-      start: new Date(dayStart.getTime() + m * 60_000),
-      end: new Date(dayStart.getTime() + (m + durationMinutes) * 60_000),
-    });
+    // Each start is resolved through the zone rather than by adding minutes to
+    // local midnight. On a DST transition day the UTC offset changes mid-day,
+    // so midnight + 7h lands on 08:00 instead of 07:00. The end is absolute
+    // elapsed time, so a job is always exactly `durationMinutes` long.
+    const start = zonedTimeToUtc(year, month, day, 0, m, timeZone);
+    slots.push({ start, end: new Date(start.getTime() + durationMinutes * 60_000) });
   }
   return slots;
 }

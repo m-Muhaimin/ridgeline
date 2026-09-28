@@ -29,13 +29,15 @@ export function availableSlots(input: AvailabilityInput): Interval[] {
   const earliest = new Date(now.getTime() + minLeadTimeHours * 3_600_000);
   const out: Interval[] = [];
 
+  // Walk calendar dates instead of adding a fixed 24h to an instant: a DST
+  // transition shifts the local hour, which can skip or repeat a date.
+  const base = zonedParts(now, timeZone);
   for (let offset = 0; offset <= maxAdvanceDays; offset++) {
-    const cursor = new Date(now.getTime() + offset * 86_400_000);
-    const local = zonedParts(cursor, timeZone);
+    const date = new Date(Date.UTC(base.year, base.month - 1, base.day + offset));
     for (const slot of generateSlots({
-      year: local.year,
-      month: local.month,
-      day: local.day,
+      year: date.getUTCFullYear(),
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate(),
       timeZone,
       businessHours,
       durationMinutes,
