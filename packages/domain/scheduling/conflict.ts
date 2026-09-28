@@ -9,6 +9,8 @@ import type { Interval } from './timezone.js';
 export type BusyInterval = Interval & {
   bookingId?: string;
   status?: string;
+  /** Shown to the customer when their requested time is already taken. */
+  customerName?: string;
 };
 
 export function intervalsOverlap(a: Interval, b: Interval): boolean {

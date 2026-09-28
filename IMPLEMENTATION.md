@@ -990,7 +990,7 @@ Time saved per operator
 ## Sprint 2 — Domain Extraction
 
 ```text
-[ ] Extract booking service
+[x] Extract booking service
 [ ] Extract conversation service
 [x] Extract policy engine
 [x] Extract safety engine
@@ -1001,15 +1001,34 @@ Time saved per operator
 
 **Exit condition:** booking/conversation rules exist in one authoritative domain layer.
 
-> **Partial.** The policy engine (2.4) and the safety engine (Phase 4) are now
-> pure, tested modules that both the server and the browser call, so the booking
-> gate is no longer an `if` chain and the emergency rules no longer exist twice.
-> The booking and conversation services (2.2, 2.3) are still methods on
-> `server.ts`, and tenant context (2.5) is still the inlined
-> `runTenantQuery`. `server.ts` is not yet smaller; it grew, because the rules
-> it used to carry by hand are now named and tested. Frontend duplication is
-> down, not gone: availability and emergency triage are shared, the rest of the
-> business logic still lives in `App.tsx`.
+> **Partial.** Three of the six are done. The policy engine (2.4) and the safety
+> engine (Phase 4) are pure modules the server and the browser both call, so the
+> booking gate is no longer an `if` chain and the emergency rules exist once.
+>
+> The booking service (2.2) now lives in
+> `packages/application/booking-service.ts` behind a `Queryable` port, so
+> `server.ts` no longer knows how to build an instant, read a working window,
+> or decide whether a time is free. That took 428 lines out of `server.ts`
+> (3727 to 3308) and made the rules reachable by a test: the 22 booking-service
+> tests run against a fake client, with no server, no database and no network.
+> Two defects surfaced that no test could previously have caught, because both
+> paths only ran after booting the app against live Neon:
+>
+> - **A degenerate working window silently made an organization unbookable.**
+>   A stored `17:30` to `07:30` passed validation, produced a zero-length day,
+>   and every request was then refused as "outside working hours" with nothing
+>   to look at. An incoherent pair is now treated as misconfiguration and falls
+>   back to a real day.
+> - **`BusyInterval` had three incompatible shapes.** The conflict name shown to
+>   the customer was passed through untyped casts, and the busy loader stored a
+>   customer name in a field named `id` that the type did not declare. The
+>   loader now returns the declared `bookingId` and `customerName`, and the
+>   conflict message is type-checked and still names the customer when known.
+>
+> Still open: the conversation service (2.3) is still methods on `server.ts`,
+> and tenant context (2.5) is still the inlined `runTenantQuery`. Frontend
+> duplication is down, not gone: availability and emergency triage are shared,
+> the rest of the business logic still lives in `App.tsx`.
 
 ---
 
