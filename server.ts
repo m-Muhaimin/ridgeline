@@ -1,6 +1,4 @@
 import express, { Request, Response, NextFunction } from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import { Pool } from '@neondatabase/serverless';
@@ -50,10 +48,6 @@ import {
 // Load both .env.local and .env
 dotenv.config({ path: '.env.local' });
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 
 const app = express();
 // Hosts (Render, Heroku, PaaS) inject a dynamic port via PORT, so honour it and keep 3000 as the local-dev fallback.
@@ -186,6 +180,14 @@ function buildAllowedOrigins(): string[] {
     .filter(Boolean);
   const appUrl = process.env.APP_URL;
   const set = new Set<string>([...fromEnv, ...(appUrl ? [appUrl] : [])]);
+  // Two-process dev: the Next app runs on :3001 and proxies /api/* here, so a
+  // proxied POST arrives with Host: localhost:3000 but Origin:
+  // http://localhost:3001. Seed both dev origins so the CSRF guard does not
+  // reject our own frontend. Production stays strictly env-driven.
+  if (process.env.NODE_ENV !== 'production') {
+    set.add('http://localhost:3000');
+    set.add('http://localhost:3001');
+  }
   return [...set];
 }
 
@@ -2189,8 +2191,8 @@ function getInMemoryOrgContext(orgId: string) {
 // API: Process incoming SMS (Simulator & Client)
 // Authenticated + rate limited: this endpoint runs the LLM pipeline, so leaving
 // it public let anyone burn provider credits anonymously. The only caller is
-// src/App.tsx handleProcessCustomerSms, which renders exclusively inside
-// <ProtectedRoute> and goes through apiFetch (credentials: 'include' + Bearer).
+// Handler callers: the apps/web DataProvider sms-handling flow (handleProcessCustomerSms)
+// and the SmsInbox simulate drawer, both behind the app's auth+permission middleware.
 app.post(
   '/api/sms/process',
   requireAuth,
@@ -2535,9 +2537,9 @@ app.post('/webhooks/twilio/voice-status', twilioFormParser, verifyTwilioSignatur
 
 // API: Process simulated missed call to auto-SMS
 // Authenticated + rate limited for the same reason as /api/sms/process: it
-// runs an LLM call. No live client caller exists (the simulate-call modal is
-// never mounted and issues no fetch); the URL shown in SettingsView is display
-// text only, and real inbound calls arrive via /webhooks/twilio/voice.
+// runs an LLM call. The simulate-call modal is mounted on the apps/web
+// missed-calls page and POSTs here; real inbound calls arrive via
+// /webhooks/twilio/voice.
 app.post(
   '/api/missed-call/process',
   requireAuth,
@@ -2813,17 +2815,18 @@ async function initDb() {
   }
 }
 
-// Vite Middleware for development vs Static files in production
+// Boots the API only. The web UI is a separate Next.js process (apps/web, :3001)
+// that proxies /api/* here — see next.config.ts. Nothing in this process serves
+// static files or an SPA fallback.
 async function startServer() {
   await initDb();
 
-  // Unmatched /api/* paths must fail as JSON, never fall through to the SPA.
+  // Unmatched /api/* paths must fail as JSON, never fall through to a host page.
   // Every /api/* route is registered at module load (before startServer runs),
-  // so anything still reaching here is genuinely unknown. In dev the Vite
-  // middleware (appType: 'spa') and in production the app.get('*') catch-all
-  // would otherwise answer an unknown API path with index.html + HTTP 200,
-  // making a missing endpoint indistinguishable from a successful call.
-  // This sits above both so dev and production behave identically.
+  // so anything still reaching here is genuinely unknown. A host-level reverse
+  // proxy or static host would otherwise answer an unknown API path with an
+  // HTML page + HTTP 200, making a missing endpoint indistinguishable from a
+  // successful call; this guard makes every /api/* miss a JSON 404 instead.
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (!req.path.startsWith('/api/')) {
       return next();
@@ -2835,20 +2838,6 @@ async function startServer() {
       hint: 'Check the path and HTTP method against the /api/* routes in server.ts.',
     });
   });
-
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
-  }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`RidgeLine server running on http://0.0.0.0:${PORT}`);

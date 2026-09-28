@@ -62,15 +62,19 @@ Solo plumbers, electricians, locksmiths, and HVAC technicians face a persistent 
 
 ## 🏛️ System Architecture
 
+Two processes. The host (or `next.config.ts` in development) routes `/api/*` and `/webhooks/*` to
+Express and everything else to Next.js.
+
 ```
                           ┌──────────────────────────┐
                           │   Twilio SMS / Voice     │
                           │   (Webhooks & Messages)  │
                           └────────────┬─────────────┘
-                                       │
+                                       │  (POST /webhooks/twilio/* — straight to :3000,
+                                       │   never through the Next rewrite)
                                        ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                          Express Server (:3000)                        │
+│              Express API Server (:3000)  — API ONLY                    │
 │                                                                        │
 │  ┌───────────────────────┐  ┌─────────────────┐  ┌──────────────────┐  │
 │  │ Gemini 2.5 Flash SDK  │  │ Neon Lakebase   │  │ Auth & Security  │  │
@@ -78,20 +82,27 @@ Solo plumbers, electricians, locksmiths, and HVAC technicians face a persistent 
 │  │ (Triage & Slot Match) │  │ (Postgres 15+)  │  │ Tenant Isolator  │  │
 │  └───────────────────────┘  └─────────────────┘  └──────────────────┘  │
 └──────────────────────────────────────┬─────────────────────────────────┘
-                                       │
+                                       │  /api/*  (rewrites() proxy in dev,
+                                       │   host-level path split in production)
                                        ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        React 19 Frontend (Vite)                        │
+│            Next.js App Router (:3001)  — UI ONLY                       │
 │                                                                        │
 │  ┌───────────────────────┐  ┌─────────────────┐  ┌──────────────────┐  │
 │  │ Dispatch Kanban Board │  │ SMS Inbox View  │  │ Missed Call Desk │  │
+│  │      /dispatch        │  │      /sms       │  │   /missed-calls  │  │
 │  └───────────────────────┘  └─────────────────┘  └──────────────────┘  │
 │  ┌───────────────────────┐  ┌─────────────────┐  ┌──────────────────┐  │
 │  │ Recharts Visualizer   │  │ Customer CRM    │  │ Org & Settings   │  │
-│  │ (with Skeleton State) │  │ & Service Specs │  │ & Live Simulator │  │
+│  │ (with Skeleton State) │  │   /customers    │  │ & Live Simulator │  │
+│  │    /  (overview)      │  │ /services       │  │    /settings     │  │
 │  └───────────────────────┘  └─────────────────┘  └──────────────────┘  │
+│                                                                        │
+│  Also: /auth  /onboarding   (own route group, own package.json)         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+Express serves no HTML: the only frontend it can emit is a JSON 404 for an unmatched `/api/*` path.
 
 ---
 
@@ -99,34 +110,52 @@ Solo plumbers, electricians, locksmiths, and HVAC technicians face a persistent 
 
 ```
 ├── .agents/skills/            # Agent tool skills (Neon, AI gateway, auth)
-├── index.html                 # App HTML shell with Bricolage & IBM Plex typography
 ├── metadata.json              # Studio project metadata and capabilities
-├── package.json               # Dependencies & build scripts
-├── server.ts                  # Express backend with Gemini AI & Neon Postgres integration
-├── src/
-│   ├── App.tsx                # Main application orchestrator & routing
+├── package.json               # API deps & scripts (the web app has its own)
+├── bun.lock                   # Committed root lockfile (API deps)
+├── server.ts                  # Express API (:3000) — routes, AI pipeline, Neon. No UI.
+├── packages/                  # domain/ + application/ logic and the 159-test suite
+├── scripts/                   # migrate.ts, migrate-auth.ts, backfill-booking-instents.ts
+├── apps/web/                  # Next.js App Router frontend (:3001) — the whole UI
+│   ├── app/
+│   │   ├── (dashboard)/
+│   │   │   ├── page.tsx              # /            overview + completed-bookings chart
+│   │   │   ├── dispatch/page.tsx      # /dispatch    kanban board + workload velocity
+│   │   │   ├── sms/page.tsx           # /sms         2-way SMS inbox
+│   │   │   ├── missed-calls/page.tsx  # /missed-calls recovery desk + bar chart
+│   │   │   ├── customers/page.tsx     # /customers   CRM profiles & revenue chart
+│   │   │   ├── services/page.tsx      # /services    trade catalog, pricing & parts
+│   │   │   ├── settings/page.tsx      # /settings    org config, AI tone, simulators
+│   │   │   └── layout.tsx             # dashboard shell (sidebar + header)
+│   │   ├── (auth)/
+│   │   │   ├── auth/page.tsx          # /auth        login & registration
+│   │   │   └── onboarding/page.tsx    # /onboarding  4-step setup wizard
+│   │   ├── health/page.tsx            # /health      frontend-only liveness route
+│   │   ├── layout.tsx  globals.css
 │   ├── components/
-│   │   ├── ChartSkeleton.tsx         # Reusable Recharts skeleton loading states
-│   │   ├── CompletedBookingsChart.tsx# 7-day bookings overview Recharts component
-│   │   ├── MetricCards.tsx           # Quick metric indicators with sparkline bars
-│   │   ├── DispatchBoard.tsx         # Dispatch kanban & 7-day workload velocity chart
-│   │   ├── SmsInbox.tsx              # Interactive 2-way SMS conversation thread viewer
-│   │   ├── MissedCallsView.tsx       # Missed call recovery table & 7-day bar chart
-│   │   ├── CustomersView.tsx         # Client profiles, history & revenue area chart
-│   │   ├── ServiceCatalog.tsx        # Trade service pricing, durations & parts
-│   │   ├── Header.tsx                # App bar with live sync button & status
-│   │   ├── AppSidebar.tsx            # Navigation sidebar with unread counters
-│   │   ├── OrgSwitcher.tsx           # Multi-organization switcher
-│   │   ├── OrganizationSettings.tsx  # Trade configuration & AI tone settings
-│   │   ├── SimulateSmsModal.tsx      # Interactive customer SMS tester
-│   │   ├── SimulateCallModal.tsx     # Voice call simulation & textback trigger
-│   │   └── NewBookingModal.tsx       # Manual dispatch appointment creator
-│   ├── pages/
-│   │   ├── AuthPage.tsx              # Secure Login & Registration
-│   │   └── OnboardingPage.tsx        # 4-step wizard for solo contractor setup
-│   ├── mockData.ts                   # In-memory baseline data & fallback state
-│   ├── types.ts                      # TypeScript models (Bookings, Threads, Orgs, Users)
-│   └── index.css                     # Tailwind CSS v4 styling & typography
+│   │   ├── DataProvider.tsx           # cross-view data context (mock seed -> /api/neon/data)
+│   │   ├── DashboardShell.tsx         # authenticated layout
+│   │   ├── AuthPage.tsx  OnboardingPage.tsx
+│   │   ├── DispatchBoard.tsx          # kanban & 7-day workload velocity chart
+│   │   ├── CompletedBookingsChart.tsx # 7-day bookings overview chart
+│   │   ├── SmsInbox.tsx               # interactive 2-way SMS thread viewer
+│   │   ├── MissedCallsView.tsx        # recovery table & 7-day bar chart
+│   │   ├── CustomersView.tsx          # client profiles, history & revenue area chart
+│   │   ├── OrganizationSettingsPanel.tsx  # trade config, AI tone, org switcher
+│   │   ├── OrganizationSettings.tsx   # trade configuration & AI tone settings
+│   │   ├── SimulateSmsModal.tsx       # customer SMS tester
+│   │   ├── SimulateCallModal.tsx      # call simulation & textback trigger
+│   │   ├── NewBookingModal.tsx        # manual dispatch appointment creator
+│   │   ├── ChartSkeleton.tsx          # reusable Recharts skeleton loading states
+│   │   ├── MetricCards.tsx            # quick metric indicators with sparkline bars
+│   │   ├── AppSidebar.tsx  Header.tsx  OrgSwitcher.tsx
+│   │   ├── AIIcon.tsx  EmptyState.tsx  RidgeLineLogo.tsx
+│   │   └── ui/                        # button.tsx, sidebar.tsx
+│   ├── lib/                          # apiFetch.ts, chartUtils.ts, triage.ts, timezones.ts, utils.ts
+│   ├── next.config.ts                # rewrites(): /api/:path* -> http://localhost:3000/api/:path*
+│   ├── package.json  tsconfig.json  postcss.config.mjs
+│   ├── mockData.ts                   # in-memory baseline data & fallback state
+│   └── types.ts                      # TypeScript models (Bookings, Threads, Orgs, Users)
 └── supabase/migrations/
     └── 20260927000000_init_ridgeline_schema.sql # Complete Postgres schema with RLS
 ```
@@ -161,20 +190,37 @@ DATABASE_URL="postgresql://user:password@host/neondb?sslmode=require"
 ```
 
 ### 3. Installation & Run
+The web app is a **separate install** from the API — run both.
 ```bash
-# Install dependencies
-npm install
+# API dependencies (root)
+npm install --legacy-peer-deps
 
-# Run the development server (Express backend + Vite frontend)
-npm run dev
+# Web dependencies (apps/web)
+npm install --prefix apps/web
 ```
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+Start **both** processes, in two terminals:
+```bash
+npm run dev        # terminal 1 -> Express API + Twilio webhooks on http://localhost:3000
+npm run dev:web    # terminal 2 -> Next.js UI on http://localhost:3001
+```
+Open [http://localhost:3001](http://localhost:3001) in your browser.
+
+**The browser only ever talks to :3001.** There is no API base URL to configure: `next.config.ts`
+proxies `/api/*` to `http://localhost:3000/api/*` with a Next rewrite, so the session cookie
+(for `localhost:3001`) is forwarded to Express unchanged. `/webhooks/*` is deliberately *not*
+proxied — Twilio posts to :3000 directly.
 
 ### 4. Build for Production
 ```bash
-npm run build
-npm run start
+npm run build:web   # next build -> apps/web/.next
+npm --prefix apps/web run start   # Next on :3001
+npm start                          # Express API on :3000
 ```
+
+Both processes must run. Route `/api/*` **and** `/webhooks/*` to the Express process and everything
+else to the Next process at the host/reverse-proxy level — the Next rewrite above is a dev
+convenience, and Twilio signature validation needs to reach Express on its real host.
 
 ---
 

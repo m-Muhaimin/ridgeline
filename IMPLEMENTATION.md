@@ -1080,17 +1080,18 @@ Time saved per operator
 ## Sprint 4 — Next.js App Router
 
 ```text
-[ ] Create apps/web
-[ ] Configure Next.js App Router
-[ ] Migrate authentication UI
-[ ] Migrate dashboard shell
-[ ] Migrate overview
-[ ] Migrate dispatch
-[ ] Migrate SMS
-[ ] Migrate customers
-[ ] Migrate services
-[ ] Migrate settings
-[ ] Remove Vite frontend
+[x] Create apps/web
+[x] Configure Next.js App Router
+[x] Migrate authentication UI
+[x] Migrate dashboard shell
+[x] Migrate overview
+[x] Migrate dispatch
+[x] Migrate SMS
+[x] Migrate missed calls
+[x] Migrate customers
+[x] Migrate services
+[x] Migrate settings
+[x] Remove Vite frontend
 ```
 
 **Exit condition:** Next.js owns the web application while Express remains the backend API.
