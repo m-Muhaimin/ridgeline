@@ -9,6 +9,13 @@ import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import twilio from 'twilio';
+import {
+  parseSlotString,
+  findConflicts,
+  zonedTimeToUtc,
+  zonedParts,
+  isValidTimeZone,
+} from './packages/domain/scheduling/index.js';
 
 // Load both .env.local and .env
 dotenv.config({ path: '.env.local' });
@@ -488,6 +495,225 @@ const inMemoryCustomers: any[] = [
 ];
 
 // Helper to run queries within tenant-scoped RLS and context
+// --- Scheduling truth ------------------------------------------------------
+// A booking is only ever written through createBookingChecked, so no code path
+// can create an overlapping visit. The interval and buffer rules are pure
+// functions in packages/domain/scheduling (unit tested); this block owns the
+// SQL and relies on the caller for the transaction boundary.
+
+class SlotUnavailableError extends Error {
+  conflicts: Array<{ id: string; customerName: string; start: string; end: string }>;
+  constructor(conflicts: Array<{ id: string; customerName: string; start: string; end: string }>) {
+    super(
+      `Requested slot conflicts with ${conflicts.length} existing booking(s): ` +
+        conflicts.map((c) => `${c.customerName} at ${c.start}`).join('; '),
+    );
+    this.name = 'SlotUnavailableError';
+    this.conflicts = conflicts;
+  }
+}
+
+class UnparseableSlotError extends Error {
+  constructor(slot: string | null | undefined) {
+    super(
+      slot
+        ? `Cannot interpret slot "${slot}". Expected a range such as "09:00 AM - 11:00 AM".`
+        : 'A time slot is required, e.g. "09:00 AM - 11:00 AM".',
+    );
+    this.name = 'UnparseableSlotError';
+  }
+}
+
+/** Turn a stored date + free-text slot into real UTC instants. */
+function resolveBookingInterval(
+  date: string,
+  timeSlot: string | null | undefined,
+  timeZone: string,
+): { start: Date; end: Date } | null {
+  const parsed = parseSlotString(timeSlot);
+  if (!parsed) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(date ?? ''));
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (!month || !day) return null;
+  const start = zonedTimeToUtc(year, month, day, Math.floor(parsed.startMinute / 60), parsed.startMinute % 60, timeZone);
+  const end = zonedTimeToUtc(year, month, day, Math.floor(parsed.endMinute / 60), parsed.endMinute % 60, timeZone);
+  if (!(end > start)) return null;
+  return { start, end };
+}
+
+/** Today in the organization's zone. Using UTC here would book New York
+ *  customers onto tomorrow whenever they write after 4pm local. */
+function localDateInZone(timeZone: string, now: Date = new Date()): string {
+  const p = zonedParts(now, timeZone);
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+}
+
+type SchedulingPolicy = { timeZone: string; bufferMinutes: number };
+
+async function loadSchedulingPolicy(client: PoolClient, orgId: string): Promise<SchedulingPolicy> {
+  const { rows } = await client.query(
+    `SELECT o.timezone,
+            COALESCE(s.buffer_minutes_between_jobs, 45) AS buffer_minutes
+       FROM public.organizations o
+       LEFT JOIN public.assistant_settings s ON s.organization_id = o.id
+      WHERE o.id = $1`,
+    [orgId],
+  );
+  if (rows.length === 0) throw new Error(`Organization ${orgId} not found`);
+  return {
+    timeZone: rows[0].timezone || 'UTC',
+    bufferMinutes: Number(rows[0].buffer_minutes) || 0,
+  };
+}
+
+/**
+ * Reject the candidate if it collides with an active booking, honouring the
+ * organization's buffer. Rows without timestamps are legacy rows that predate
+ * the scheduling migration and cannot be compared, so they are ignored.
+ */
+async function assertSlotAvailable(
+  client: PoolClient,
+  orgId: string,
+  interval: { start: Date; end: Date },
+  bufferMinutes: number,
+  excludeBookingId?: string,
+): Promise<void> {
+  const { rows } = await client.query(
+    `SELECT id, customer_name, scheduled_start, scheduled_end
+       FROM public.job_bookings
+      WHERE organization_id = $1
+        AND status IN ('scheduled', 'en_route', 'in_progress')
+        AND scheduled_start IS NOT NULL
+        AND scheduled_end > $2::timestamptz - INTERVAL '1 day'
+        AND scheduled_start < $3::timestamptz + INTERVAL '1 day'`,
+    [orgId, interval.start, interval.end],
+  );
+  const hits = findConflicts(
+    interval,
+    rows
+      .filter((r: any) => r.id !== excludeBookingId)
+      .map((r: any) => ({
+        start: new Date(r.scheduled_start),
+        end: new Date(r.scheduled_end),
+        bookingId: r.id,
+        customerName: r.customer_name,
+      })),
+    bufferMinutes,
+  );
+  if (hits.length > 0) {
+    throw new SlotUnavailableError(
+      hits.map((h: any) => ({
+        id: h.bookingId,
+        customerName: h.customerName,
+        start: h.start.toISOString(),
+        end: h.end.toISOString(),
+      })),
+    );
+  }
+}
+
+type CreateBookingInput = {
+  customerName: string;
+  customerPhone: string;
+  address: string;
+  tradeType: string;
+  serviceTitle: string;
+  serviceId?: string | null;
+  date: string;
+  timeSlot: string | null | undefined;
+  status?: string;
+  estimateAmount?: number;
+  notes?: string;
+  urgency?: string;
+  createdFrom?: string;
+  smsThreadId?: string | null;
+};
+
+/**
+ * Conflict-checked, timestamp-backed booking insert. MUST run inside a
+ * transaction that the caller owns; the exclusion constraint on
+ * job_bookings is the last line of defence against a concurrent writer.
+ */
+async function createBookingChecked(client: PoolClient, orgId: string, input: CreateBookingInput) {
+  const policy = await loadSchedulingPolicy(client, orgId);
+  const interval = resolveBookingInterval(input.date, input.timeSlot, policy.timeZone);
+  if (!interval) throw new UnparseableSlotError(input.timeSlot);
+
+  await assertSlotAvailable(client, orgId, interval, policy.bufferMinutes);
+
+  const { rows } = await client.query(
+    `INSERT INTO public.job_bookings (
+       organization_id, customer_name, customer_phone, address, trade_type, service_id,
+       service_title, scheduled_date, time_slot, status, estimate_amount,
+       notes, urgency, created_from, sms_thread_id, scheduled_start, scheduled_end, timezone
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+     RETURNING *`,
+    [
+      orgId,
+      input.customerName,
+      input.customerPhone,
+      input.address,
+      input.tradeType,
+      input.serviceId ?? null,
+      input.serviceTitle,
+      input.date,
+      input.timeSlot,
+      input.status || 'scheduled',
+      input.estimateAmount ?? 0,
+      input.notes ?? '',
+      input.urgency || 'routine',
+      input.createdFrom || 'manual',
+      input.smsThreadId ?? null,
+      interval.start,
+      interval.end,
+      policy.timeZone,
+    ],
+  );
+  return rows[0];
+}
+
+/**
+ * Move a thread's active bookings to a new slot, keeping the authoritative
+ * timestamps in step with scheduled_date / time_slot. A reschedule that
+ * would collide is rejected rather than silently double-booking.
+ */
+async function rescheduleThreadBookings(
+  client: PoolClient,
+  orgId: string,
+  threadId: string,
+  date: string,
+  timeSlot: string | null | undefined,
+): Promise<number> {
+  const policy = await loadSchedulingPolicy(client, orgId);
+  const interval = resolveBookingInterval(date, timeSlot, policy.timeZone);
+  if (!interval) throw new UnparseableSlotError(timeSlot);
+
+  const { rows } = await client.query(
+    `SELECT id FROM public.job_bookings
+      WHERE sms_thread_id = $1 AND organization_id = $2
+        AND status IN ('scheduled', 'en_route', 'in_progress')
+      FOR UPDATE`,
+    [threadId, orgId],
+  );
+  if (rows.length === 0) return 0;
+
+  for (const r of rows) {
+    await assertSlotAvailable(client, orgId, interval, policy.bufferMinutes, r.id);
+  }
+
+  await client.query(
+    `UPDATE public.job_bookings
+        SET scheduled_date = $1, time_slot = $2, scheduled_start = $3, scheduled_end = $4,
+            notes = notes || ' (Rescheduled via Twilio SMS)', updated_at = NOW()
+      WHERE sms_thread_id = $5 AND organization_id = $6`,
+    [date, timeSlot, interval.start, interval.end, threadId, orgId],
+  );
+  return rows.length;
+}
+
 async function runTenantQuery<T>(
   orgId: string,
   userId: string | null,
@@ -1322,6 +1548,7 @@ app.get('/api/neon/data', requireAuth, async (req: Request, res: Response) => {
         serviceRadiusMiles: o.service_radius_miles,
         businessAddress: o.business_address,
         email: o.email,
+        timezone: o.timezone || 'UTC',
       }));
 
       let formattedSettings = null;
@@ -1575,6 +1802,12 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Missing required booking fields' });
   }
 
+  // Previously a missing slot silently became 09:00 AM - 11:00 AM, so the
+  // customer was booked into a time they never agreed to. Fail loudly instead.
+  if (!timeSlot) {
+    return res.status(400).json({ error: 'timeSlot is required, e.g. "09:00 AM - 11:00 AM"' });
+  }
+
   if (pool) {
     try {
       const b = await runTenantQuery(orgId, userId, async (client) => {
@@ -1597,32 +1830,24 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
           }
         }
 
-        const insertRes = await client.query(
-          `INSERT INTO public.job_bookings (
-            organization_id, customer_name, customer_phone, address, trade_type,
-            service_title, scheduled_date, time_slot, status, estimate_amount,
-            notes, urgency, created_from, sms_thread_id
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-          RETURNING *;`,
-          [
-            orgId,
-            customerName,
-            customerPhone,
-            address,
-            tradeType,
-            serviceTitle,
-            date || new Date().toISOString().slice(0, 10),
-            timeSlot || '09:00 AM - 11:00 AM',
-            status,
-            estimateAmount,
-            notes,
-            urgency,
-            createdFrom,
-            resolvedThreadId,
-          ]
-        );
+        const policy = await loadSchedulingPolicy(client, orgId);
+        const booking = await createBookingChecked(client, orgId, {
+          customerName,
+          customerPhone,
+          address,
+          tradeType,
+          serviceTitle,
+          date: date || localDateInZone(policy.timeZone),
+          timeSlot,
+          status,
+          estimateAmount: Number(estimateAmount) || 0,
+          notes,
+          urgency,
+          createdFrom,
+          smsThreadId: resolvedThreadId,
+        });
 
-        return insertRes.rows[0];
+        return booking;
       });
 
       return res.json({
@@ -1646,6 +1871,16 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
         },
       });
     } catch (err: any) {
+      if (err instanceof SlotUnavailableError) {
+        return res.status(409).json({
+          error: 'That slot is already taken. Pick another time.',
+          code: 'SLOT_UNAVAILABLE',
+          conflicts: err.conflicts,
+        });
+      }
+      if (err instanceof UnparseableSlotError) {
+        return res.status(400).json({ error: err.message, code: 'UNPARSEABLE_SLOT' });
+      }
       console.error('Failed to insert booking into Neon:', err);
       return res.status(500).json({ error: err.message });
     }
@@ -1883,7 +2118,13 @@ app.post('/api/sms/message', requireAuth, async (req: Request, res: Response) =>
 app.patch('/api/organizations', requireAuth, async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
-  const { name, trade, technicianName, licenseNumber, serviceRadiusMiles, businessAddress, email, twilioPhoneNumber, forwardCallsTo } = req.body;
+  const { name, trade, technicianName, licenseNumber, serviceRadiusMiles, businessAddress, email, twilioPhoneNumber, forwardCallsTo, timezone } = req.body;
+
+  // Validated before persistence: an unknown zone only fails much later, when
+  // slot resolution calls Intl, by which point the value is already stored.
+  if (timezone !== undefined && !isValidTimeZone(timezone)) {
+    return res.status(400).json({ error: `Unknown time zone: ${String(timezone)}` });
+  }
 
   if (pool) {
     try {
@@ -1899,9 +2140,10 @@ app.patch('/api/organizations', requireAuth, async (req: Request, res: Response)
             email = COALESCE($7, email),
             twilio_phone_number = COALESCE($8, twilio_phone_number),
             forward_calls_to = COALESCE($9, forward_calls_to),
+            timezone = COALESCE($10, timezone),
             updated_at = NOW()
-          WHERE id = $10 RETURNING *;`,
-          [name, trade, technicianName, licenseNumber, serviceRadiusMiles, businessAddress, email, twilioPhoneNumber, forwardCallsTo, orgId]
+          WHERE id = $11 RETURNING *;`,
+          [name, trade, technicianName, licenseNumber, serviceRadiusMiles, businessAddress, email, twilioPhoneNumber, forwardCallsTo, timezone, orgId]
         );
         return result.rows[0];
       });
@@ -1922,6 +2164,7 @@ app.patch('/api/organizations', requireAuth, async (req: Request, res: Response)
     if (email) org.email = email;
     if (twilioPhoneNumber) org.twilioPhoneNumber = twilioPhoneNumber;
     if (forwardCallsTo) org.forwardCallsTo = forwardCallsTo;
+    if (timezone) (org as any).timezone = timezone;
   }
   res.json({ success: true, organization: org });
 });
@@ -2580,64 +2823,95 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
       },
     });
 
-    // Persist incoming customer message and outgoing assistant reply
+    // Persist the exchange and any confirmed booking in ONE transaction. The
+    // reply must never claim a booking that failed to commit, so the booking
+    // decision happens before the assistant message is written.
+    let replyText = assistantResult.replyText;
+    let threadStatus = assistantResult.shouldConfirmBooking ? 'booked' : 'active';
+    let bookingId: string | null = null;
+    const SLOT_UNAVAILABLE_REPLY =
+      'Sorry - that time has just been taken. I will ask the technician to call you and find another slot.';
+
     if (pool) {
-      await pool.query(
-        `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag)
-         VALUES ($1, 'customer', $2, null);`,
-        [threadId, body]
-      );
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
 
-      await pool.query(
-        `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag, parsed_intent)
-         VALUES ($1, 'assistant', $2, $3, $4);`,
-        [threadId, assistantResult.replyText, assistantResult.actionTag, JSON.stringify(assistantResult)]
-      );
+        await client.query(
+          `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag)
+           VALUES ($1, 'customer', $2, null);`,
+          [threadId, body],
+        );
 
-      await pool.query(
-        'UPDATE public.sms_threads SET last_activity_at = NOW(), status = $1 WHERE id = $2;',
-        [assistantResult.shouldConfirmBooking ? 'booked' : 'active', threadId]
-      );
-
-      // Handle booking confirmation or reschedule
-      if (assistantResult.shouldConfirmBooking) {
-        if (assistantResult.intent === 'reschedule') {
-          const nextDay = new Date(Date.now() + 86400000).toISOString().split('T')[0];
-          const slot = assistantResult.suggestedSlot || '09:00 AM - 11:00 AM';
-          await pool.query(
-            `UPDATE public.job_bookings SET scheduled_date = $1, time_slot = $2, notes = notes || ' (Rescheduled via Twilio SMS)'
-             WHERE sms_thread_id = $3 AND organization_id = $4;`,
-            [nextDay, slot, threadId, orgId]
-          );
-        } else {
-          const bookingDate = new Date().toISOString().split('T')[0];
-          const slot = assistantResult.suggestedSlot || '01:30 PM - 03:30 PM';
-          const bkRes = await pool.query(
-            `INSERT INTO public.job_bookings (
-              organization_id, customer_name, customer_phone, address, trade_type,
-              service_title, scheduled_date, time_slot, status, estimate_amount,
-              notes, urgency, created_from, sms_thread_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'scheduled', $9, $10, $11, 'sms', $12)
-            RETURNING id;`,
-            [
-              orgId,
-              customerName,
-              from,
-              assistantResult.extractedAddress || customerAddress || 'Address requested via SMS',
-              org.trade || 'plumbing',
-              assistantResult.serviceTitle || 'General Diagnostic & Repair',
-              bookingDate,
-              slot,
-              assistantResult.estimatedPrice || 250,
-              'Auto-confirmed by RidgeLine AI Assistant via live Twilio SMS webhook.',
-              assistantResult.urgency || 'routine',
-              threadId,
-            ]
-          );
-          if (bkRes.rows[0]?.id) {
-            await pool.query('UPDATE public.sms_threads SET booking_id = $1 WHERE id = $2;', [bkRes.rows[0].id, threadId]);
+        if (assistantResult.shouldConfirmBooking) {
+          // A savepoint lets a constraint violation be caught without
+          // aborting the whole transaction.
+          await client.query('SAVEPOINT sched');
+          try {
+            const policy = await loadSchedulingPolicy(client, orgId);
+            if (assistantResult.intent === 'reschedule') {
+              const nextDate = localDateInZone(policy.timeZone, new Date(Date.now() + 86400000));
+              await rescheduleThreadBookings(
+                client,
+                orgId,
+                threadId,
+                nextDate,
+                assistantResult.suggestedSlot,
+              );
+            } else {
+              const booking = await createBookingChecked(client, orgId, {
+                customerName,
+                customerPhone: from,
+                address: assistantResult.extractedAddress || customerAddress || 'Address requested via SMS',
+                tradeType: org.trade || 'plumbing',
+                serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
+                date: localDateInZone(policy.timeZone),
+                timeSlot: assistantResult.suggestedSlot,
+                status: 'scheduled',
+                estimateAmount: assistantResult.estimatedPrice || 250,
+                notes: 'Auto-confirmed by RidgeLine AI Assistant via live Twilio SMS webhook.',
+                urgency: assistantResult.urgency || 'routine',
+                createdFrom: 'sms',
+                smsThreadId: threadId,
+              });
+              bookingId = booking.id;
+            }
+            await client.query('RELEASE SAVEPOINT sched');
+          } catch (bookingErr: any) {
+            await client.query('ROLLBACK TO SAVEPOINT sched');
+            const recoverable =
+              bookingErr instanceof SlotUnavailableError ||
+              bookingErr instanceof UnparseableSlotError ||
+              bookingErr?.code === '23P01';
+            if (!recoverable) throw bookingErr;
+            console.error('SMS booking rejected:', bookingErr.message);
+            bookingId = null;
+            threadStatus = 'active';
+            replyText = SLOT_UNAVAILABLE_REPLY;
           }
         }
+
+        await client.query(
+          `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag, parsed_intent)
+           VALUES ($1, 'assistant', $2, $3, $4);`,
+          [threadId, replyText, assistantResult.actionTag, JSON.stringify(assistantResult)],
+        );
+
+        await client.query(
+          'UPDATE public.sms_threads SET last_activity_at = NOW(), status = $1 WHERE id = $2;',
+          [threadStatus, threadId],
+        );
+
+        if (bookingId) {
+          await client.query('UPDATE public.sms_threads SET booking_id = $1 WHERE id = $2;', [bookingId, threadId]);
+        }
+
+        await client.query('COMMIT');
+      } catch (persistErr: any) {
+        await client.query('ROLLBACK');
+        console.error('Failed to persist SMS exchange:', persistErr);
+      } finally {
+        client.release();
       }
     } else {
       // In-memory message persistence

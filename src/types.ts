@@ -114,6 +114,8 @@ export interface Organization {
   serviceRadiusMiles?: number;
   businessAddress?: string;
   email?: string;
+  /** IANA zone, e.g. America/New_York. Authoritative for booking instants. */
+  timezone?: string;
 }
 
 export interface User {

@@ -925,14 +925,31 @@ export default function App() {
               <OrganizationSettings
                 currentOrg={currentOrg}
                 onUpdateOrg={(updated) => {
+                  const previous = currentOrg;
+                  // Optimistic, but reverted on failure: the server validates
+                  // values (e.g. rejects an unknown time zone), and a bare
+                  // fetch().catch(console.warn) would leave a rejected save
+                  // looking saved.
                   setCurrentOrg(updated);
                   setOrganizations(prev => prev.map(o => o.id === updated.id ? updated : o));
-                  fetch('/api/organizations', {
+                  apiFetch('/api/organizations', {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
                     credentials: 'include',
                     body: JSON.stringify(updated),
-                  }).catch(e => console.warn('Org update err:', e));
+                  })
+                    .then((res: any) => {
+                      // Re-sync from the server's authoritative row (RETURNING *).
+                      if (res?.organization) {
+                        setCurrentOrg(res.organization);
+                        setOrganizations(prev => prev.map(o => o.id === res.organization.id ? res.organization : o));
+                      }
+                    })
+                    .catch((e) => {
+                      setCurrentOrg(previous);
+                      setOrganizations(prev => prev.map(o => o.id === previous.id ? previous : o));
+                      showToast(`Could not save organization: ${e.message}`);
+                    });
                 }}
                 settings={settings}
                 onUpdateSettings={(newSettings) => {

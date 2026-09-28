@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { listTimeZones, groupTimeZones, timeZoneOptionLabel } from '../lib/timezones';
 import { 
   Building2, 
   DollarSign, 
@@ -58,7 +59,12 @@ export const OrganizationSettings: React.FC<OrganizationSettingsProps> = ({
     // The forwarding number lives on the org row, but older orgs only have it on
     // assistant_settings — fall back so the field is never silently blanked.
     forwardCallsTo: currentOrg.forwardCallsTo || settings.forwardCallsTo || '',
+    // Bookings resolve their instants against this zone, so it must be set
+    // before any slot is offered. UTC is the column default, not a good answer.
+    timezone: currentOrg.timezone || 'UTC',
   });
+
+  const timeZoneGroups = groupTimeZones(listTimeZones());
 
   // Assistant Settings form state
   const [aiForm, setAiForm] = useState<AssistantSettings>(settings);
@@ -310,6 +316,29 @@ export const OrganizationSettings: React.FC<OrganizationSettingsProps> = ({
                   />
                   <span className="text-neutral-500 shrink-0 font-medium">miles</span>
                 </div>
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-neutral-700 mb-1">Time Zone</label>
+                <select
+                  value={orgForm.timezone || 'UTC'}
+                  onChange={(e) => setOrgForm({ ...orgForm, timezone: e.target.value })}
+                  className="w-full bg-neutral-50 border border-neutral-200 rounded px-3 py-1.5 text-neutral-900 focus:bg-white focus:outline-none"
+                >
+                  {timeZoneGroups.map((group) => (
+                    <optgroup key={group.region} label={group.region}>
+                      {group.zones.map((zone) => (
+                        <option key={zone} value={zone}>
+                          {timeZoneOptionLabel(zone)}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <p className="mt-1.5 text-xs text-neutral-500">
+                  Booking times are agreed and displayed in this zone, and stored as UTC instants.
+                  Leaving it on UTC will place your appointments several hours off.
+                </p>
               </div>
             </div>
 

@@ -45,12 +45,67 @@ async function runMigration() {
       END $$;
     `);
 
-    const migrationPath = path.resolve(process.cwd(), 'supabase/migrations/20260927000000_init_ridgeline_schema.sql');
-    const migrationContent = fs.readFileSync(migrationPath, 'utf8');
+    // Applied-migration tracking. Without it this script is a fresh-install
+    // script: re-running the init file fails with 42710 duplicate_object
+    // because it adds foreign keys unconditionally.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.schema_migrations (
+        filename TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-    console.log('Executing schema migration...');
-    await client.query(migrationContent);
-    console.log('Migration successfully applied to Neon Lakebase Postgres!');
+    const migrationsDir = path.resolve(process.cwd(), 'supabase/migrations');
+    const migrationFiles = fs
+        .readdirSync(migrationsDir)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+
+    if (migrationFiles.length === 0) {
+        throw new Error(`No .sql migration files found in ${migrationsDir}`);
+    }
+
+    // Databases created before tracking existed have no rows, so bootstrap the
+    // init file as already applied when its tables are actually present.
+    const legacy = await client.query(
+        `SELECT to_regclass('public.job_bookings') IS NOT NULL AS present`,
+    );
+    if (legacy.rows[0].present) {
+        await client.query(
+            `INSERT INTO public.schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING`,
+            [migrationFiles[0]],
+        );
+    }
+
+    for (const file of migrationFiles) {
+        const done = await client.query(
+            'SELECT 1 FROM public.schema_migrations WHERE filename = $1',
+            [file],
+        );
+        if (done.rows.length > 0) {
+            console.log(`Skipping ${file} (already applied)`);
+            continue;
+        }
+
+        const migrationContent = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+        console.log(`Applying ${file}...`);
+        // One transaction per migration: either the whole file lands and gets
+        // recorded, or nothing changes.
+        await client.query('BEGIN');
+        try {
+            await client.query(migrationContent);
+            await client.query(
+                'INSERT INTO public.schema_migrations (filename) VALUES ($1)',
+                [file],
+            );
+            await client.query('COMMIT');
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw new Error(`Migration ${file} failed and was rolled back: ${(err as Error).message}`);
+        }
+        console.log(`Applied ${file}`);
+    }
+    console.log('All migrations applied to Neon Lakebase Postgres!');
 
     // Verify tables
     const tablesRes = await client.query(`
