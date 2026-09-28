@@ -2,8 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
-import { Pool, PoolClient } from '@neondatabase/serverless';
+import { GoogleGenAI } from '@google/genai';
+import { Pool } from '@neondatabase/serverless';
 import fs from 'fs';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
@@ -23,16 +23,29 @@ import {
   type BusyInterval,
   type Interval,
 } from './packages/domain/scheduling/index.js';
-import { decide, isWriteAction } from './packages/domain/conversations/policy-engine.js';
-import { detectEmergency } from './packages/domain/safety/triage.js';
+// The in-memory half of the webhook org lookup. Aliased so it does not collide
+// with the async DB-backed findOrgByTwilioNumber() below, which calls it.
 import {
-  SlotUnavailableError, UnparseableSlotError, assertSlotAvailable, cancelThreadBookings,
-  composeOfferReply, createBookingChecked, loadBusyIntervals, loadSchedulingPolicy,
-  localDateInZone, proposeAvailableSlots, rescheduleThreadBookings, resolveBookingInterval,
-  resolveRequestedSlot, resolveServiceDuration, withinBusinessHours, timeColumnToMinutes,
-  DEFAULT_MAX_ADVANCE_DAYS, DEFAULT_SERVICE_MINUTES, SLOT_STEP_MINUTES,
-  type CreateBookingInput, type ResolvedSlot, type SchedulingPolicy, type SlotOffer,
+  findOrgByTwilioNumber as findMatchingOrg,
+  normalizePhone,
+} from './packages/domain/organizations/twilio-phone.js';
+import { can, type Permission } from './packages/domain/organizations/roles.js';
+import {
+  SlotUnavailableError, UnparseableSlotError, createBookingChecked, loadBusyIntervals,
+  loadSchedulingPolicy, localDateInZone, proposeAvailableSlots,
+  DEFAULT_SERVICE_MINUTES, SLOT_STEP_MINUTES, type SlotOffer,
 } from './packages/application/booking-service.js';
+import { runTenantQuery } from './packages/application/tenant-context.js';
+import { processInboundSms } from './packages/application/conversation-service.js';
+import { toUuid } from './packages/application/id-utils.js';
+import {
+  DEFAULT_OPENAI_API_KEY,
+  DEFAULT_OPENAI_BASE_URL,
+  DEFAULT_OPENAI_MODEL,
+  RIDGELINE_SYSTEM_PROMPT,
+  callOpenAiCompatibleChat,
+  runSmsAssistant,
+} from './packages/application/ai-pipeline.js';
 
 // Load both .env.local and .env
 dotenv.config({ path: '.env.local' });
@@ -112,7 +125,6 @@ const { jwtSecret: JWT_SECRET, cookieSecret: COOKIE_SECRET } = resolveSigningSec
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+15557824309';
-const FORWARD_CALLS_TO = process.env.FORWARD_CALLS_TO || '+15551234567';
 
 const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)
   ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -160,6 +172,45 @@ function verifyTwilioSignature(req: Request, res: Response, next: NextFunction) 
 app.use(express.json());
 app.use(cookieParser(COOKIE_SECRET));
 
+// CSRF / cross-origin guard: the session cookie can be SameSite=None in
+// production, so a signed-in user's browser would happily attach it to a
+// request originating from an attacker's page. State-changing /api calls must
+// prove they come from this app's origin (or an explicitly allowed one).
+// Webhook routes are deliberately excluded (Twilio signature verification is
+// their auth; they are never driven by a user's browser session).
+function buildAllowedOrigins(): string[] {
+  const fromEnv = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const appUrl = process.env.APP_URL;
+  const set = new Set<string>([...fromEnv, ...(appUrl ? [appUrl] : [])]);
+  return [...set];
+}
+
+function isAllowedOrigin(req: Request): boolean {
+  const originHeader = req.get('origin') || req.get('referer');
+  if (!originHeader) return true; // non-browser client; requireAuth still applies
+
+  let originUrl: URL;
+  try {
+    originUrl = new URL(originHeader);
+  } catch {
+    return false;
+  }
+
+  const host = req.get('host') || '';
+  if (originUrl.host === host) return true; // same origin the app is served from
+
+  return buildAllowedOrigins().includes(originUrl.origin);
+}
+
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  if (isAllowedOrigin(req)) return next();
+  return res.status(403).json({ error: 'Cross-origin request rejected.' });
+});
+
 // Initialize Google GenAI client if API key is present
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
@@ -185,115 +236,6 @@ if (dbUrl) {
     console.log('Neon Lakebase Postgres pool initialized');
   } catch (err) {
     console.error('Failed to initialize Neon pool:', err);
-  }
-}
-
-// System instruction for RidgeLine Trade Assistant
-const RIDGELINE_SYSTEM_PROMPT = `You are "RidgeLine", an intelligent SMS scheduling and dispatch assistant representing a solo licensed tradesperson (plumber, electrician, or HVAC technician).
-The tradesperson is actively on tools (under a sink, in an attic, or in a trench) and cannot text or answer calls.
-
-Your job:
-1. Handle incoming customer SMS text messages warmly, concisely, and decisively. Sound like a helpful human assistant or the owner's dedicated dispatcher (not a robotic corporate chatbot).
-2. Triage urgency:
-   - "emergency": Active flooding, sewage backup, carbon monoxide, no heat in winter, sparking electrical. Advise immediate safety steps (e.g. "please shut off the main water valve clockwise") and prioritize immediate scheduling.
-   - "urgent": Major inconvenience (e.g., sole toilet clogged, water heater pilot out).
-   - "routine": Maintenance, faucet replacements, EV chargers, quotes.
-3. Handle bookings:
-   - Identify service needed and match with service catalog.
-   - Propose 1-2 concrete time slots.
-   - Collect address if not provided.
-   - Auto-confirm when client agrees to a slot.
-4. Handle reschedules:
-   - Parse natural language reschedule requests (e.g. "push to Thursday morning", "can we do 4pm instead?").
-   - Offer the new slot and confirm update.
-5. Tone: Short, helpful text messages (1 to 3 sentences max, suitable for SMS). Keep sentences crisp. Never write long multi-paragraph essays.`;
-
-// Default OpenAI-compatible endpoint settings (e.g. 9router, LiteLLM, vLLM, Ollama)
-const DEFAULT_OPENAI_BASE_URL = process.env.OPENAI_COMPATIBLE_BASE_URL || 'https://9router-production-a99a.up.railway.app/v1';
-// Empty-string (not undefined) so the truthiness-based provider-selection chain
-// below degrades cleanly to Gemini and then the deterministic responder when
-// OPENAI_COMPATIBLE_API_KEY is unset, instead of attempting a request with a
-// missing key.
-const DEFAULT_OPENAI_API_KEY = process.env.OPENAI_COMPATIBLE_API_KEY || '';
-const DEFAULT_OPENAI_MODEL = process.env.OPENAI_COMPATIBLE_MODEL || 'gemini/gemini-3.8-flash';
-
-// Helper to call OpenAI-compatible chat completions endpoint with json output
-async function callOpenAiCompatibleChat(options: {
-  baseUrl?: string;
-  apiKey?: string;
-  model?: string;
-  systemPrompt: string;
-  userPrompt: string;
-  jsonMode?: boolean;
-}): Promise<string> {
-  const baseUrl = (options.baseUrl || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
-  const apiKey = options.apiKey || DEFAULT_OPENAI_API_KEY;
-  const model = options.model || DEFAULT_OPENAI_MODEL;
-
-  // Refuse to call out with an empty bearer token. `llmProvider` is hydrated as
-  // 'openai_compatible' by default (see assistant_settings load), so this branch
-  // is reachable with no key configured; sending `Authorization: Bearer ` would
-  // spend a doomed round-trip on a guaranteed 401. Throwing lets the caller's
-  // existing catch hand off to Gemini and then the deterministic responder.
-  if (!apiKey) {
-    throw new Error('OpenAI-compatible API key is not configured');
-  }
-
-  const url = `${baseUrl}/chat/completions`;
-  const body: any = {
-    model,
-    messages: [
-      { role: 'system', content: options.systemPrompt },
-      { role: 'user', content: options.userPrompt },
-    ],
-    temperature: 0.2,
-  };
-
-  if (options.jsonMode) {
-    body.response_format = { type: 'json_object' };
-  }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`OpenAI-compatible API error (${response.status}): ${errText}`);
-  }
-
-  const text = await response.text();
-
-  // Handle both standard JSON responses and SSE streams if returned
-  try {
-    const json = JSON.parse(text);
-    return json.choices?.[0]?.message?.content || '';
-  } catch (e) {
-    // Check if response is Server-Sent Events (data: {...})
-    if (text.includes('data:')) {
-      let accumulatedContent = '';
-      const lines = text.split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('data:') && !trimmed.includes('[DONE]')) {
-          const chunkStr = trimmed.slice(5).trim();
-          try {
-            const chunk = JSON.parse(chunkStr);
-            const delta = chunk.choices?.[0]?.delta?.content || chunk.choices?.[0]?.message?.content || '';
-            accumulatedContent += delta;
-          } catch (err) {
-            // continue
-          }
-        }
-      }
-      if (accumulatedContent) return accumulatedContent;
-    }
-    return text;
   }
 }
 
@@ -430,12 +372,8 @@ function isValidUuid(id: any): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
-function toUuid(input?: any): string {
-  if (!input) return crypto.randomUUID ? crypto.randomUUID() : '00000000-0000-0000-0000-000000000000';
-  if (isValidUuid(input)) return input;
-  const hash = crypto.createHash('md5').update('ridgeline:' + String(input)).digest('hex');
-  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
-}
+// toUuid itself now lives in packages/application/id-utils.ts, shared with the
+// conversation service so both sides derive thread ids the same way.
 
 // In-Memory Multi-Tenant Store for standalone/preview environment
 const inMemoryOrgs: any[] = [
@@ -511,38 +449,6 @@ const inMemoryCustomers: any[] = [
   { id: 'a2222222-aaaa-2222-aaaa-222222222222', organizationId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', name: 'Marcus Vance', phone: '+1 (555) 349-1122', email: 'mvance99@example.com', address: '1840 Highland Ridge Dr, Westview', notes: 'Rheem 50-gal unit.', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
 ];
 
-
-// Helper to run queries within tenant-scoped RLS and context
-async function runTenantQuery<T>(
-  orgId: string,
-  userId: string | null,
-  callback: (client: PoolClient) => Promise<T>
-): Promise<T> {
-  if (!pool) throw new Error('Database connection pool is not configured');
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    // Set tenant session configuration for RLS policies
-    await client.query(`SELECT set_config('app.current_organization_id', $1, true);`, [orgId]);
-    if (userId) {
-      await client.query(`SELECT set_config('app.current_user_id', $1, true);`, [userId]);
-    }
-    // Switch to ridgeline_app tenant role so RLS is actively enforced
-    try {
-      await client.query('SET LOCAL ROLE ridgeline_app;');
-    } catch (e) {
-      // Role might not be provisioned yet in preview environment
-    }
-    const result = await callback(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    client.release();
-  }
-}
 
 // ==========================================
 // RATE LIMITING (dependency-free, in-process)
@@ -681,6 +587,21 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
 
   clearSessionCookie(res);
   return res.status(401).json({ error: 'Session user could not be found.' });
+}
+
+// Authorization Middleware: checks the authenticated user's role against the
+// permission matrix. Mount it immediately AFTER requireAuth (it reads the req.user
+// that requireAuth populated) and BEFORE any rate limiter. Pure role check — no DB.
+function requirePermission(permission: Permission) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    if (!can(req.user.role as any, permission)) {
+      return res.status(403).json({ error: `Forbidden: requires ${permission} permission.` });
+    }
+    return next();
+  };
 }
 
 // POST /api/auth/register
@@ -1030,7 +951,7 @@ app.post('/api/auth/complete-onboarding', requireAuth, async (req: Request, res:
 
   if (pool) {
     try {
-      await runTenantQuery(orgId, userId, async (client) => {
+      await runTenantQuery(pool, orgId, userId, async (client) => {
         if (orgId && isValidUuid(orgId)) {
           await client.query(
             `UPDATE public.organizations SET
@@ -1240,7 +1161,7 @@ app.get('/api/neon/data', requireAuth, async (req: Request, res: Response) => {
 
   if (pool) {
     try {
-      const data = await runTenantQuery(orgId, userId, async (client) => {
+      const data = await runTenantQuery(pool, orgId, userId, async (client) => {
         const [orgs, settings, services, bookings, threads, messages, calls, customers] = await Promise.all([
           client.query('SELECT * FROM public.organizations WHERE id = $1;', [orgId]),
           client.query('SELECT * FROM public.assistant_settings WHERE organization_id = $1;', [orgId]),
@@ -1444,7 +1365,7 @@ app.get('/api/customers', requireAuth, async (req: Request, res: Response) => {
 
   if (pool) {
     try {
-      const customers = await runTenantQuery(orgId, userId, async (client) => {
+      const customers = await runTenantQuery(pool, orgId, userId, async (client) => {
         const result = await client.query('SELECT * FROM public.customers WHERE organization_id = $1 ORDER BY name ASC;', [orgId]);
         return result.rows;
       });
@@ -1458,7 +1379,7 @@ app.get('/api/customers', requireAuth, async (req: Request, res: Response) => {
   res.json({ success: true, customers });
 });
 
-app.post('/api/customers', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/customers', requireAuth, requirePermission('customers.write'), async (req: Request, res: Response) => {
   // Always derive organizationId server-side from session!
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
@@ -1470,7 +1391,7 @@ app.post('/api/customers', requireAuth, async (req: Request, res: Response) => {
 
   if (pool) {
     try {
-      const customer = await runTenantQuery(orgId, userId, async (client) => {
+      const customer = await runTenantQuery(pool, orgId, userId, async (client) => {
         const result = await client.query(
           `INSERT INTO public.customers (organization_id, name, phone, email, address, notes)
            VALUES ($1, $2, $3, $4, $5, $6)
@@ -1516,7 +1437,7 @@ app.post('/api/customers', requireAuth, async (req: Request, res: Response) => {
   res.json({ success: true, customer: newCust });
 });
 
-app.patch('/api/customers/:id', requireAuth, async (req: Request, res: Response) => {
+app.patch('/api/customers/:id', requireAuth, requirePermission('customers.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { id } = req.params;
@@ -1525,7 +1446,7 @@ app.patch('/api/customers/:id', requireAuth, async (req: Request, res: Response)
   if (pool) {
     try {
       const custUuid = isValidUuid(id) ? id : toUuid(id);
-      const customer = await runTenantQuery(orgId, userId, async (client) => {
+      const customer = await runTenantQuery(pool, orgId, userId, async (client) => {
         const result = await client.query(
           `UPDATE public.customers SET name = COALESCE($1, name), email = COALESCE($2, email), 
            address = COALESCE($3, address), notes = COALESCE($4, notes), updated_at = NOW()
@@ -1553,7 +1474,7 @@ app.patch('/api/customers/:id', requireAuth, async (req: Request, res: Response)
   res.json({ success: true, customer: cust });
 });
 
-app.delete('/api/customers/:id', requireAuth, async (req: Request, res: Response) => {
+app.delete('/api/customers/:id', requireAuth, requirePermission('customers.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { id } = req.params;
@@ -1561,7 +1482,7 @@ app.delete('/api/customers/:id', requireAuth, async (req: Request, res: Response
   if (pool) {
     try {
       const custUuid = isValidUuid(id) ? id : toUuid(id);
-      await runTenantQuery(orgId, userId, async (client) => {
+      await runTenantQuery(pool, orgId, userId, async (client) => {
         await client.query('DELETE FROM public.customers WHERE id = $1 AND organization_id = $2;', [custUuid, orgId]);
       });
       return res.json({ success: true });
@@ -1638,7 +1559,7 @@ app.get('/api/availability', requireAuth, async (req: Request, res: Response) =>
   }
 });
 
-app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/bookings', requireAuth, requirePermission('bookings.create'), async (req: Request, res: Response) => {
   // Always derive organizationId server-side from session!
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
@@ -1671,7 +1592,7 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
 
   if (pool) {
     try {
-      const b = await runTenantQuery(orgId, userId, async (client) => {
+      const b = await runTenantQuery(pool, orgId, userId, async (client) => {
         // Automatically upsert customer record within this tenant
         await client.query(
           `INSERT INTO public.customers (organization_id, name, phone, address)
@@ -1776,7 +1697,7 @@ app.post('/api/bookings', requireAuth, async (req: Request, res: Response) => {
 });
 
 // Update Job Booking status or slot - Scoped to tenant
-app.patch('/api/bookings/:id', requireAuth, async (req: Request, res: Response) => {
+app.patch('/api/bookings/:id', requireAuth, requirePermission('bookings.update'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { id } = req.params;
@@ -1811,7 +1732,7 @@ app.patch('/api/bookings/:id', requireAuth, async (req: Request, res: Response) 
         values.push(orgId);
         const query = `UPDATE public.job_bookings SET ${updates.join(', ')} WHERE id = $${idx++} AND organization_id = $${idx} RETURNING *;`;
         
-        const b = await runTenantQuery(orgId, userId, async (client) => {
+        const b = await runTenantQuery(pool, orgId, userId, async (client) => {
           const resUp = await client.query(query, values);
           return resUp.rows[0];
         });
@@ -1856,7 +1777,7 @@ app.patch('/api/bookings/:id', requireAuth, async (req: Request, res: Response) 
 });
 
 // Add message to SMS Thread in Neon Postgres - Tenant Scoped
-app.post('/api/sms/message', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/sms/message', requireAuth, requirePermission('sms.send'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
 
@@ -1885,7 +1806,7 @@ app.post('/api/sms/message', requireAuth, async (req: Request, res: Response) =>
 
   if (pool) {
     try {
-      const savedMsg = await runTenantQuery(orgId, userId, async (client) => {
+      const savedMsg = await runTenantQuery(pool, orgId, userId, async (client) => {
         // Ensure thread belongs to user's organization
         const threadCheck = await client.query('SELECT id FROM public.sms_threads WHERE id = $1 AND organization_id = $2;', [threadUuid, orgId]);
 
@@ -1976,7 +1897,7 @@ app.post('/api/sms/message', requireAuth, async (req: Request, res: Response) =>
 });
 
 // PATCH /api/organizations - Update organization details for authenticated user's organization
-app.patch('/api/organizations', requireAuth, async (req: Request, res: Response) => {
+app.patch('/api/organizations', requireAuth, requirePermission('settings.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { name, trade, technicianName, licenseNumber, serviceRadiusMiles, businessAddress, email, twilioPhoneNumber, forwardCallsTo, timezone } = req.body;
@@ -1989,7 +1910,7 @@ app.patch('/api/organizations', requireAuth, async (req: Request, res: Response)
 
   if (pool) {
     try {
-      const updated = await runTenantQuery(orgId, userId, async (client) => {
+      const updated = await runTenantQuery(pool, orgId, userId, async (client) => {
         const result = await client.query(
           `UPDATE public.organizations SET
             name = COALESCE($1, name),
@@ -2050,7 +1971,7 @@ function stripServerOnlyAssistantKeys(body: any): any {
 }
 
 // PATCH /api/assistant-settings - Update settings for authenticated user's organization
-app.patch('/api/assistant-settings', requireAuth, async (req: Request, res: Response) => {
+app.patch('/api/assistant-settings', requireAuth, requirePermission('settings.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const {
@@ -2069,7 +1990,7 @@ app.patch('/api/assistant-settings', requireAuth, async (req: Request, res: Resp
 
   if (pool) {
     try {
-      const updated = await runTenantQuery(orgId, userId, async (client) => {
+      const updated = await runTenantQuery(pool, orgId, userId, async (client) => {
         const result = await client.query(
           `INSERT INTO public.assistant_settings (
             organization_id, ai_tone, auto_confirm_routine, buffer_minutes_between_jobs,
@@ -2117,7 +2038,7 @@ app.patch('/api/assistant-settings', requireAuth, async (req: Request, res: Resp
 });
 
 // POST /api/services - Create trade service in catalog
-app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/services', requireAuth, requirePermission('services.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { title, trade, durationHours, basePrice, description, isPopular } = req.body;
@@ -2126,7 +2047,7 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
 
   if (pool) {
     try {
-      const s = await runTenantQuery(orgId, userId, async (client) => {
+      const s = await runTenantQuery(pool, orgId, userId, async (client) => {
         const resInsert = await client.query(
           `INSERT INTO public.services (organization_id, title, trade, duration_hours, base_price, description, is_popular)
            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *;`,
@@ -2155,7 +2076,7 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
 });
 
 // DELETE /api/services/:id - Delete trade service
-app.delete('/api/services/:id', requireAuth, async (req: Request, res: Response) => {
+app.delete('/api/services/:id', requireAuth, requirePermission('services.write'), async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
   const { id } = req.params;
@@ -2163,7 +2084,7 @@ app.delete('/api/services/:id', requireAuth, async (req: Request, res: Response)
   if (pool) {
     try {
       const sUuid = isValidUuid(id) ? id : toUuid(id);
-      await runTenantQuery(orgId, userId, async (client) => {
+      await runTenantQuery(pool, orgId, userId, async (client) => {
         await client.query('DELETE FROM public.services WHERE id = $1 AND organization_id = $2;', [sUuid, orgId]);
       });
       return res.json({ success: true });
@@ -2178,7 +2099,7 @@ app.delete('/api/services/:id', requireAuth, async (req: Request, res: Response)
 });
 
 // POST /api/organizations/switch - Switch active organization for user session
-app.post('/api/organizations/switch', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/organizations/switch', requireAuth, requirePermission('organizations.switch'), async (req: Request, res: Response) => {
   const { organizationId } = req.body;
   if (!organizationId) {
     return res.status(400).json({ error: 'Target organizationId required' });
@@ -2214,320 +2135,41 @@ app.post('/api/organizations/switch', requireAuth, async (req: Request, res: Res
   res.json({ success: true, organizationId });
 });
 
-// Helper to normalize phone numbers for consistent matching
-function normalizePhone(p?: string | null): string {
-  if (!p) return '';
-  return p.replace(/\D/g, '');
-}
-
-// Helper to look up organization by Twilio phone number
+// Helper to look up organization by Twilio phone number.
+// Returns the matching org, or null. There is deliberately no "first org in the
+// database" fallback: an unrecognized Twilio number belongs to nobody, and the
+// callers below handle that by answering deterministically.
 async function findOrgByTwilioNumber(twilioNumber?: string) {
   const normalized = normalizePhone(twilioNumber);
+  if (!normalized) return null;
   if (pool) {
     try {
-      if (normalized) {
-        const res = await pool.query(
-          `SELECT * FROM public.organizations 
-           WHERE regexp_replace(twilio_phone_number, '[^0-9]', '', 'g') = $1 
-              OR twilio_phone_number = $2 
-           LIMIT 1;`,
-          [normalized, twilioNumber || '']
-        );
-        if (res.rows.length > 0) return res.rows[0];
-      }
-      // Fallback to first registered organization
-      const fallback = await pool.query('SELECT * FROM public.organizations ORDER BY created_at ASC LIMIT 1;');
-      return fallback.rows[0] || null;
+      const res = await pool.query(
+        `SELECT * FROM public.organizations 
+         WHERE regexp_replace(twilio_phone_number, '[^0-9]', '', 'g') = $1 
+            OR twilio_phone_number = $2 
+         LIMIT 1;`,
+        [normalized, twilioNumber || '']
+      );
+      if (res.rows.length > 0) return res.rows[0];
     } catch (e) {
       console.warn('Error querying organization by twilio number:', e);
     }
   }
 
   // In-memory fallback
-  const match = inMemoryOrgs.find(o => normalizePhone(o.twilioPhoneNumber) === normalized || o.twilioPhoneNumber === twilioNumber);
-  return match || inMemoryOrgs[0] || null;
+  return findMatchingOrg(inMemoryOrgs, normalized);
 }
 
-// Helper to retrieve organization context (settings, services, bookings)
-async function getOrgContext(orgId: string) {
-  if (pool) {
-    try {
-      const [settingsRes, servicesRes, bookingsRes] = await Promise.all([
-        pool.query('SELECT * FROM public.assistant_settings WHERE organization_id = $1;', [orgId]),
-        pool.query('SELECT * FROM public.services WHERE organization_id = $1 ORDER BY created_at ASC;', [orgId]),
-        pool.query('SELECT * FROM public.job_bookings WHERE organization_id = $1 ORDER BY scheduled_date DESC LIMIT 10;', [orgId]),
-      ]);
-
-      const s = settingsRes.rows[0];
-      const settings = s ? {
-        aiTone: s.ai_tone,
-        autoConfirmRoutine: s.auto_confirm_routine,
-        bufferMinutesBetweenJobs: s.buffer_minutes_between_jobs,
-        workingHours: {
-          start: s.working_hours_start?.slice(0, 5) || '07:30',
-          end: s.working_hours_end?.slice(0, 5) || '17:30',
-          workWeekends: s.work_weekends,
-        },
-        emergencyKeywords: s.emergency_keywords || [],
-        llmProvider: s.llm_provider || 'openai_compatible',
-        openaiBaseUrl: s.openai_base_url || DEFAULT_OPENAI_BASE_URL,
-        openaiApiKey: s.openai_api_key || DEFAULT_OPENAI_API_KEY,
-        openaiModel: s.openai_model || DEFAULT_OPENAI_MODEL,
-      } : {};
-
-      const services = servicesRes.rows.map(srv => ({
-        id: srv.id,
-        title: srv.title,
-        trade: srv.trade,
-        durationHours: parseFloat(srv.duration_hours) || 1.5,
-        basePrice: parseFloat(srv.base_price) || 195,
-        description: srv.description || '',
-      }));
-
-      const bookings = bookingsRes.rows.map(b => ({
-        id: b.id,
-        customerName: b.customer_name,
-        date: typeof b.scheduled_date === 'string' ? b.scheduled_date.slice(0, 10) : new Date(b.scheduled_date).toISOString().slice(0, 10),
-        timeSlot: b.time_slot,
-        status: b.status,
-      }));
-
-      return { settings, services, bookings };
-    } catch (e) {
-      console.warn('Error fetching org context:', e);
-    }
-  }
-
+// The organization context for the no-database path. The database-backed half
+// of the old getOrgContext() now lives in
+// packages/application/conversation-service.ts as loadOrgContext(), which reads
+// through the tenant transaction the webhook already owns.
+function getInMemoryOrgContext(orgId: string) {
   const settings = inMemorySettings[orgId] || inMemorySettings[inMemoryOrgs[0].id] || {};
   const services = inMemoryServices.filter(s => s.organizationId === orgId);
   const bookings = inMemoryBookings.filter(b => b.organizationId === orgId);
   return { settings, services, bookings };
-}
-
-export interface RunSmsAssistantOptions {
-  incomingText: string;
-  customerName?: string;
-  customerPhone?: string;
-  address?: string;
-  conversationHistory?: Array<{ sender: string; text: string }>;
-  existingBookings?: any[];
-  services?: any[];
-  settings?: any;
-}
-
-export interface SmsAssistantResult {
-  source: string;
-  replyText: string;
-  intent: 'book' | 'reschedule' | 'cancel' | 'inquiry' | 'emergency' | 'confirm';
-  urgency: 'routine' | 'urgent' | 'emergency';
-  actionTag: 'auto_booked' | 'rescheduled' | 'quote_given' | 'emergency_escalated' | 'slot_offered' | 'info_requested';
-  serviceTitle: string | null;
-  /**
-   * A time the CUSTOMER asked for, verbatim, or null. Never a time the model
-   * chose: a proposed clock time is a scheduling decision, and those come
-   * from business hours plus live bookings, not from a language model.
-   */
-  requestedSlot: string | null;
-  extractedAddress: string | null;
-  estimatedPrice: number;
-  shouldConfirmBooking: boolean;
-  model?: string;
-}
-
-// Shared SMS Assistant Pipeline (OpenAI-compatible -> Gemini -> Rule-based fallback)
-export async function runSmsAssistant(options: RunSmsAssistantOptions): Promise<SmsAssistantResult> {
-  const {
-    incomingText,
-    customerName,
-    customerPhone,
-    address,
-    conversationHistory = [],
-    existingBookings = [],
-    services = [],
-    settings = {},
-  } = options;
-
-  let parsedResult: any = null;
-
-  const prompt = `
-Context:
-- Business: ${settings.businessName || 'Apex Trades'}
-- Tradesperson: ${settings.tradespersonName || 'Mark'} (${settings.tradeType || 'plumbing'})
-- Customer Name: ${customerName || 'Customer'}
-- Customer Phone: ${customerPhone || 'Unknown'}
-- Known Customer Address: ${address || 'Not yet provided'}
-- Today's Date: ${new Date().toISOString().split('T')[0]}
-- Available Services: ${JSON.stringify(services.map((s: any) => ({ title: s.title, price: s.basePrice, durationHours: s.durationHours })))}
-- Recent Bookings: ${JSON.stringify(existingBookings.map((b: any) => ({ id: b.id, name: b.customerName, date: b.date, slot: b.timeSlot, status: b.status })))}
-
-Conversation history so far:
-${conversationHistory.map((m: any) => `${m.sender === 'customer' ? 'Customer' : 'Assistant'}: ${m.text}`).join('\n')}
-
-New incoming SMS from customer:
-"${incomingText}"
-
-Analyze this message, determine the intent, formulate the optimal SMS response, and extract structured data.
-You MUST return a JSON object with the following schema:
-{
-  "replyText": "exact SMS text string under 300 characters, friendly and direct",
-  "intent": "book" | "reschedule" | "cancel" | "inquiry" | "emergency" | "confirm",
-  "urgency": "routine" | "urgent" | "emergency",
-  "actionTag": "auto_booked" | "rescheduled" | "quote_given" | "emergency_escalated" | "slot_offered" | "info_requested",
-  "serviceTitle": "matched service title or null",
-  "requestedSlot": "a time the CUSTOMER explicitly asked for, copied verbatim, or null. NEVER invent, guess or infer a time that was not stated.",
-  "extractedAddress": "address extracted from message if any or null",
-  "estimatedPrice": number,
-  "shouldConfirmBooking": boolean (true if slot explicitly confirmed/booked/rescheduled)
-}`;
-
-  const preferredProvider = settings.llmProvider || (settings.openaiApiKey || DEFAULT_OPENAI_API_KEY ? 'openai_compatible' : 'gemini');
-
-  if (preferredProvider === 'openai_compatible') {
-    try {
-      const rawContent = await callOpenAiCompatibleChat({
-        baseUrl: settings.openaiBaseUrl || DEFAULT_OPENAI_BASE_URL,
-        apiKey: settings.openaiApiKey || DEFAULT_OPENAI_API_KEY,
-        model: settings.openaiModel || DEFAULT_OPENAI_MODEL,
-        systemPrompt: RIDGELINE_SYSTEM_PROMPT,
-        userPrompt: prompt,
-        jsonMode: true,
-      });
-
-      const cleaned = rawContent.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
-      parsedResult = JSON.parse(cleaned);
-      parsedResult.source = 'openai_compatible';
-      parsedResult.model = settings.openaiModel || DEFAULT_OPENAI_MODEL;
-    } catch (openAiErr: any) {
-      console.warn('OpenAI-compatible call failed, falling back:', openAiErr.message);
-    }
-  }
-
-  // Secondary fallback: Gemini SDK if available
-  if (!parsedResult && ai) {
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: {
-          systemInstruction: RIDGELINE_SYSTEM_PROMPT,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              replyText: {
-                type: Type.STRING,
-                description: 'The exact SMS text message to send back to the customer (keep under 300 characters, friendly and direct).',
-              },
-              intent: {
-                type: Type.STRING,
-                enum: ['book', 'reschedule', 'cancel', 'inquiry', 'emergency', 'confirm'],
-                description: 'Primary customer intent',
-              },
-              urgency: {
-                type: Type.STRING,
-                enum: ['routine', 'urgent', 'emergency'],
-                description: 'Urgency tier of the job',
-              },
-              actionTag: {
-                type: Type.STRING,
-                enum: ['auto_booked', 'rescheduled', 'quote_given', 'emergency_escalated', 'slot_offered', 'info_requested'],
-                description: 'Action taken by the assistant',
-              },
-              serviceTitle: {
-                type: Type.STRING,
-                description: 'Matched trade service title, if determined.',
-              },
-              requestedSlot: {
-                type: Type.STRING,
-                description: 'A time the customer explicitly asked for, copied verbatim, or null. Never invent a time.',
-              },
-              extractedAddress: {
-                type: Type.STRING,
-                description: 'Address extracted from text if provided.',
-              },
-              estimatedPrice: {
-                type: Type.NUMBER,
-                description: 'Estimated dollar cost based on service catalog, or 0 if unknown.',
-              },
-              shouldConfirmBooking: {
-                type: Type.BOOLEAN,
-                description: 'True if a new booking or slot was explicitly agreed upon and should be added/updated in the schedule.',
-              },
-            },
-            required: ['replyText', 'intent', 'urgency', 'actionTag', 'shouldConfirmBooking'],
-          },
-        },
-      });
-
-      parsedResult = JSON.parse(response.text?.trim() || '{}');
-      parsedResult.source = 'gemini';
-    } catch (geminiErr: any) {
-      console.warn('Gemini call failed, falling back to rule-based engine:', geminiErr.message);
-    }
-  }
-
-  if (!parsedResult) {
-    // Deterministic rule-based fallback
-    const lower = incomingText.toLowerCase();
-    let intent: 'book' | 'reschedule' | 'cancel' | 'inquiry' | 'emergency' | 'confirm' = 'inquiry';
-    let urgency: 'routine' | 'urgent' | 'emergency' = 'routine';
-    let actionTag: 'auto_booked' | 'rescheduled' | 'quote_given' | 'emergency_escalated' | 'slot_offered' | 'info_requested' = 'info_requested';
-    const techName = settings.tradespersonName || 'Mark';
-    let replyText = `Thanks for reaching out! ${techName} is on a service call. Can you share what issue you're experiencing and your address?`;
-    let shouldConfirmBooking = false;
-    // The rule engine classifies intent only. It has no reliable way to tell
-    // whether a customer named a time, and a guessed one gets written straight
-    // into the schedule, so it defers to the scheduling engine.
-    let requestedSlot: string | null = null;
-    let estimatedPrice = 250;
-    let serviceTitle = 'General Service Diagnostic';
-
-    // One triage rule, shared with the browser. It reads the organization's own
-    // emergency keywords and answers with the right safety instruction: a gas
-    // leak is told to leave, not to go hunting for a valve.
-    const triage = detectEmergency(incomingText, settings.emergencyKeywords);
-    if (triage.isEmergency) {
-      intent = 'emergency';
-      urgency = 'emergency';
-      actionTag = 'emergency_escalated';
-      replyText = `${triage.guidance} ${techName} will get on this as fast as possible - what is your street address?`;
-      estimatedPrice = 380;
-      serviceTitle = 'Emergency Burst Pipe & Valve Shutoff';
-    } else if (lower.includes('reschedule') || lower.includes('push to') || lower.includes('move to') || lower.includes('another day') || lower.includes('can we do')) {
-      intent = 'reschedule';
-      urgency = 'routine';
-      // Offering is not rescheduling. The move happens once the customer
-      // names a real opening, not one the fallback made up.
-      actionTag = 'slot_offered';
-      shouldConfirmBooking = false;
-      replyText = `No problem at all, I can move that. ${techName} has a few openings - which one works for you?`;
-    } else if (lower.includes('yes') || lower.includes('sounds good') || lower.includes('perfect') || lower.includes('confirm') || lower.includes('book it')) {
-      intent = 'confirm';
-      // "Yes" confirms the last thing offered, not a time invented here.
-      actionTag = 'slot_offered';
-      shouldConfirmBooking = false;
-      replyText = `Great - tell me which time works and I'll lock it in on ${techName}'s schedule.`;
-    } else if (lower.includes('how much') || lower.includes('cost') || lower.includes('quote') || lower.includes('price')) {
-      intent = 'inquiry';
-      actionTag = 'quote_given';
-      replyText = `Our standard diagnostic & basic service call is $195-$285 depending on parts required. Want me to check ${techName}'s openings for you?`;
-    }
-
-    parsedResult = {
-      source: 'fallback',
-      replyText,
-      intent,
-      urgency,
-      actionTag,
-      serviceTitle,
-      requestedSlot,
-      extractedAddress: address || '',
-      estimatedPrice,
-      shouldConfirmBooking,
-    };
-  }
-
-  return parsedResult;
 }
 
 // API: Process incoming SMS (Simulator & Client)
@@ -2538,6 +2180,7 @@ You MUST return a JSON object with the following schema:
 app.post(
   '/api/sms/process',
   requireAuth,
+  requirePermission('assistant.run'),
   rateLimitPerOrg({ scope: 'sms-process' }),
   async (req: Request, res: Response) => {
   try {
@@ -2571,7 +2214,7 @@ app.post(
       existingBookings,
       services,
       settings: safeSettings,
-    });
+    }, { gemini: ai });
 
     return res.json({
       success: true,
@@ -2598,12 +2241,27 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
     if (!org) {
       console.warn('No organization found for Twilio number:', to);
       const twiml = new MessagingResponse();
-      twiml.message("RidgeLine Dispatch: Service currently offline for this number.");
+      twiml.message('RidgeLine Dispatch: this number is not currently connected to a dispatch line. Please try again later.');
       return res.type('text/xml').send(twiml.toString());
     }
 
     const orgId = org.id;
-    const { settings, services, bookings } = await getOrgContext(orgId);
+
+    if (pool) {
+      // One tenant-scoped transaction for the whole conversation: context load,
+      // customer/thread lookup, the assistant, and the persist-and-book writes.
+      // The service issues no BEGIN/COMMIT of its own -- the caller's
+      // runTenantQuery owns that -- so a reply can only be returned for state
+      // that actually committed.
+      const outcome = await runTenantQuery(pool, orgId, null, (client) =>
+        processInboundSms({ db: client, org, from, to, body, messageSid: req.body.MessageSid ?? null, gemini: ai }));
+      const twiml = new MessagingResponse();
+      twiml.message(outcome.replyText);
+      return res.type('text/xml').send(twiml.toString());
+    }
+
+    // In-memory fallback (no DATABASE_URL).
+    const { settings, services, bookings } = getInMemoryOrgContext(orgId);
 
     // Look up or initialize customer
     let customerName = 'Customer';
@@ -2611,74 +2269,34 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
     let threadId: string;
     let history: Array<{ sender: string; text: string }> = [];
 
-    if (pool) {
-      // Lookup customer
-      const custRes = await pool.query(
-        'SELECT * FROM public.customers WHERE organization_id = $1 AND phone = $2 LIMIT 1;',
-        [orgId, from]
-      );
-      if (custRes.rows.length > 0) {
-        customerName = custRes.rows[0].name;
-        customerAddress = custRes.rows[0].address || '';
-      }
-
-      // Lookup or create SMS thread
-      const thrdRes = await pool.query(
-        'SELECT * FROM public.sms_threads WHERE organization_id = $1 AND customer_phone = $2 LIMIT 1;',
-        [orgId, from]
-      );
-
-      if (thrdRes.rows.length > 0) {
-        const t = thrdRes.rows[0];
-        threadId = t.id;
-        if (!customerAddress && t.address) customerAddress = t.address;
-        if (customerName === 'Customer' && t.customer_name) customerName = t.customer_name;
-
-        // Fetch recent message history for context
-        const msgRes = await pool.query(
-          'SELECT sender, text FROM public.sms_messages WHERE thread_id = $1 ORDER BY created_at ASC LIMIT 12;',
-          [threadId]
-        );
-        history = msgRes.rows;
-      } else {
-        threadId = crypto.randomUUID ? crypto.randomUUID() : toUuid(`tw-th-${from}-${Date.now()}`);
-        await pool.query(
-          `INSERT INTO public.sms_threads (
-            id, organization_id, customer_name, customer_phone, address, trade_type, status, last_activity_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW());`,
-          [threadId, orgId, customerName, from, customerAddress, org.trade || 'plumbing']
-        );
-      }
-    } else {
-      // In-memory fallback
-      let memCust = inMemoryCustomers.find(c => c.organizationId === orgId && c.phone === from);
-      if (memCust) {
-        customerName = memCust.name;
-        customerAddress = memCust.address || '';
-      }
-
-      let memThread = inMemoryThreads.find(t => t.organizationId === orgId && t.customerPhone === from);
-      if (!memThread) {
-        threadId = `th-tw-${Date.now()}`;
-        memThread = {
-          id: threadId,
-          organizationId: orgId,
-          customerName,
-          customerPhone: from,
-          address: customerAddress,
-          tradeType: org.trade || 'plumbing',
-          unreadCount: 0,
-          status: 'active',
-          lastActivityAt: new Date().toISOString(),
-        };
-        inMemoryThreads.unshift(memThread);
-      } else {
-        threadId = memThread.id;
-        if (!customerAddress && memThread.address) customerAddress = memThread.address;
-      }
-
-      history = inMemoryMessages.filter(m => m.threadId === threadId).slice(-12).map(m => ({ sender: m.sender, text: m.text }));
+    // In-memory fallback
+    let memCust = inMemoryCustomers.find(c => c.organizationId === orgId && c.phone === from);
+    if (memCust) {
+      customerName = memCust.name;
+      customerAddress = memCust.address || '';
     }
+
+    let memThread = inMemoryThreads.find(t => t.organizationId === orgId && t.customerPhone === from);
+    if (!memThread) {
+      threadId = `th-tw-${Date.now()}`;
+      memThread = {
+        id: threadId,
+        organizationId: orgId,
+        customerName,
+        customerPhone: from,
+        address: customerAddress,
+        tradeType: org.trade || 'plumbing',
+        unreadCount: 0,
+        status: 'active',
+        lastActivityAt: new Date().toISOString(),
+      };
+      inMemoryThreads.unshift(memThread);
+    } else {
+      threadId = memThread.id;
+      if (!customerAddress && memThread.address) customerAddress = memThread.address;
+    }
+
+    history = inMemoryMessages.filter(m => m.threadId === threadId).slice(-12).map(m => ({ sender: m.sender, text: m.text }));
 
     // Run AI / Assistant logic
     const assistantResult = await runSmsAssistant({
@@ -2695,192 +2313,50 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
         tradespersonName: org.technician_name || org.technicianName || 'Mark',
         tradeType: org.trade || 'plumbing',
       },
+    }, { gemini: ai });
+
+    // In-memory message persistence
+    const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    inMemoryMessages.push({
+      id: `msg-${Date.now()}-1`,
+      threadId,
+      sender: 'customer',
+      text: body,
+      timestamp: nowStr,
+      status: 'delivered',
+    });
+    inMemoryMessages.push({
+      id: `msg-${Date.now()}-2`,
+      threadId,
+      sender: 'assistant',
+      text: assistantResult.replyText,
+      timestamp: nowStr,
+      status: 'delivered',
+      actionTag: assistantResult.actionTag,
     });
 
-    // Persist the exchange and any confirmed booking in ONE transaction. The
-    // reply must never claim a booking that failed to commit, so the booking
-    // decision happens before the assistant message is written.
-    let replyText = assistantResult.replyText;
-    // A thread is only "booked" once an interval is actually written, which is
-    // decided inside the transaction below.
-    let threadStatus = 'active';
-    let bookingId: string | null = null;
-    const SLOT_UNAVAILABLE_REPLY =
-      'Sorry - that time has just been taken. I will ask the technician to call you and find another slot.';
-
-    if (pool) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-
-        await client.query(
-          `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag)
-           VALUES ($1, 'customer', $2, null);`,
-          [threadId, body],
-        );
-
-        // Phase 1.5: intent becomes either a real interval or a list of real
-        // openings -- never a time the language model made up. A booking is
-        // only written once the customer has named an opening we verified.
-        let policy: SchedulingPolicy | null = null;
-        let resolved: ResolvedSlot | null = null;
-        let offers: SlotOffer[] = [];
-
-        const activeRes = await client.query(
-          `SELECT 1 FROM public.job_bookings
-            WHERE sms_thread_id = $1 AND status = ANY($2::booking_status[]) LIMIT 1;`,
-          [threadId, ['scheduled', 'en_route', 'in_progress']],
-        );
-        const hasExistingBooking = (activeRes.rows?.length || 0) > 0;
-
-        // Resolve what the customer actually said BEFORE deciding anything: the
-        // policy engine takes a verified fact, not the model's opinion.
-        if (assistantResult.intent !== 'inquiry' || assistantResult.requestedSlot) {
-          policy = await loadSchedulingPolicy(client, orgId);
-          const durationMinutes = resolveServiceDuration(assistantResult.serviceTitle, services);
-          const resolution = await resolveRequestedSlot(
-            client,
-            orgId,
-            assistantResult.requestedSlot,
-            durationMinutes,
-            policy,
-          );
-          resolved = resolution.match;
-          offers = resolution.offers;
-        }
-
-        const decision = decide({
-          intent: assistantResult.intent,
-          urgency: assistantResult.urgency,
-          serviceIdentified: !!(assistantResult.serviceTitle && assistantResult.serviceTitle !== 'General Service Diagnostic'),
-          addressKnown: !!(assistantResult.extractedAddress || customerAddress),
-          requestedSlot: assistantResult.requestedSlot,
-          slotResolution: resolved ? 'available' : assistantResult.requestedSlot ? 'unavailable' : 'unstated',
-          autoConfirmEnabled: settings.autoConfirmRoutine !== false,
-          hasExistingBooking,
-        });
-        if (decision.requiresHuman) {
-          console.log(`[policy] ${decision.action}: ${decision.reason} (thread ${threadId})`);
-        }
-
-        if (!decision.mayWrite && offers.length > 0) {
-          // Nothing bookable yet: show the customer what is actually open.
-          replyText = composeOfferReply(offers, policy!.timeZone);
-          threadStatus = 'active';
-        }
-
-        if (decision.mayWrite && isWriteAction(decision.action) && (resolved || decision.action === 'cancel')) {
-          // A savepoint lets a constraint violation be caught without
-          // aborting the whole transaction.
-          await client.query('SAVEPOINT sched');
-          try {
-            if (decision.action === 'cancel') {
-              await cancelThreadBookings(client, orgId, threadId);
-              replyText = 'Your booking is cancelled. Sorry to see you go - we will be here when you need us.';
-            } else if (decision.action === 'reschedule') {
-              await rescheduleThreadBookings(client, orgId, threadId, resolved!.date, resolved!.timeSlot);
-              replyText = `Moved. You're booked for ${resolved!.label} on ${resolved!.date}. You'll get a text when the technician is on the way.`;
-            } else {
-              const booking = await createBookingChecked(client, orgId, {
-                customerName,
-                customerPhone: from,
-                address: assistantResult.extractedAddress || customerAddress || 'Address requested via SMS',
-                tradeType: org.trade || 'plumbing',
-                serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
-                date: resolved!.date,
-                timeSlot: resolved!.timeSlot,
-                status: 'scheduled',
-                estimateAmount: assistantResult.estimatedPrice || 250,
-                notes: 'Auto-confirmed by RidgeLine AI Assistant via live Twilio SMS webhook.',
-                urgency: assistantResult.urgency || 'routine',
-                createdFrom: 'sms',
-                smsThreadId: threadId,
-              });
-              bookingId = booking.id;
-              replyText = `You're booked! ${resolved!.label} on ${resolved!.date}. You'll get a text when the technician is on the way.`;
-            }
-            await client.query('RELEASE SAVEPOINT sched');
-          } catch (bookingErr: any) {
-            await client.query('ROLLBACK TO SAVEPOINT sched');
-            const recoverable =
-              bookingErr instanceof SlotUnavailableError ||
-              bookingErr instanceof UnparseableSlotError ||
-              bookingErr?.code === '23P01';
-            if (!recoverable) throw bookingErr;
-            console.error('SMS booking rejected:', bookingErr.message);
-            bookingId = null;
-            threadStatus = 'active';
-            replyText = SLOT_UNAVAILABLE_REPLY;
-          }
-        }
-
-        await client.query(
-          `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag, parsed_intent)
-           VALUES ($1, 'assistant', $2, $3, $4);`,
-          [threadId, replyText, assistantResult.actionTag, JSON.stringify(assistantResult)],
-        );
-
-        if (decision.action === 'cancel' && decision.mayWrite) threadStatus = 'booked';
-        await client.query(
-          'UPDATE public.sms_threads SET last_activity_at = NOW(), status = $1 WHERE id = $2;',
-          [threadStatus, threadId],
-        );
-
-        if (bookingId) {
-          await client.query('UPDATE public.sms_threads SET booking_id = $1 WHERE id = $2;', [bookingId, threadId]);
-        }
-
-        await client.query('COMMIT');
-      } catch (persistErr: any) {
-        await client.query('ROLLBACK');
-        console.error('Failed to persist SMS exchange:', persistErr);
-      } finally {
-        client.release();
-      }
-    } else {
-      // In-memory message persistence
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      inMemoryMessages.push({
-        id: `msg-${Date.now()}-1`,
-        threadId,
-        sender: 'customer',
-        text: body,
-        timestamp: nowStr,
-        status: 'delivered',
+    // Without a database there is no availability source, so nothing is
+    // written: inventing "01:30 PM - 03:30 PM" here would be the exact bug
+    // the scheduling engine exists to remove.
+    if (assistantResult.requestedSlot) {
+      inMemoryBookings.unshift({
+        id: `bk-tw-${Date.now().toString().slice(-4)}`,
+        organizationId: orgId,
+        customerName,
+        customerPhone: from,
+        address: assistantResult.extractedAddress || customerAddress || 'Address pending',
+        tradeType: org.trade || 'plumbing',
+        serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
+        date: localDateInZone(org.timezone || 'UTC'),
+        timeSlot: stripDayQualifier(assistantResult.requestedSlot) || assistantResult.requestedSlot,
+        status: 'scheduled',
+        estimateAmount: assistantResult.estimatedPrice || 250,
+        notes: 'Recorded via live Twilio SMS webhook (no database: conflict checking unavailable).',
+        urgency: assistantResult.urgency || 'routine',
+        createdFrom: 'sms',
+        smsThreadId: threadId,
+        createdAt: new Date().toISOString(),
       });
-      inMemoryMessages.push({
-        id: `msg-${Date.now()}-2`,
-        threadId,
-        sender: 'assistant',
-        text: assistantResult.replyText,
-        timestamp: nowStr,
-        status: 'delivered',
-        actionTag: assistantResult.actionTag,
-      });
-
-      // Without a database there is no availability source, so nothing is
-      // written: inventing "01:30 PM - 03:30 PM" here would be the exact bug
-      // the scheduling engine exists to remove.
-      if (assistantResult.requestedSlot) {
-        inMemoryBookings.unshift({
-          id: `bk-tw-${Date.now().toString().slice(-4)}`,
-          organizationId: orgId,
-          customerName,
-          customerPhone: from,
-          address: assistantResult.extractedAddress || customerAddress || 'Address pending',
-          tradeType: org.trade || 'plumbing',
-          serviceTitle: assistantResult.serviceTitle || 'General Diagnostic & Repair',
-          date: localDateInZone(org.timezone || 'UTC'),
-          timeSlot: stripDayQualifier(assistantResult.requestedSlot) || assistantResult.requestedSlot,
-          status: 'scheduled',
-          estimateAmount: assistantResult.estimatedPrice || 250,
-          notes: 'Recorded via live Twilio SMS webhook (no database: conflict checking unavailable).',
-          urgency: assistantResult.urgency || 'routine',
-          createdFrom: 'sms',
-          smsThreadId: threadId,
-          createdAt: new Date().toISOString(),
-        });
-      }
     }
 
     // Return TwiML
@@ -2899,7 +2375,15 @@ app.post('/webhooks/twilio/sms', twilioFormParser, verifyTwilioSignature, async 
 app.post('/webhooks/twilio/voice', twilioFormParser, verifyTwilioSignature, async (req: Request, res: Response) => {
   const to = req.body.To;
   const org = await findOrgByTwilioNumber(to);
-  const forwardTo = org?.forward_calls_to || org?.forwardCallsTo || FORWARD_CALLS_TO;
+  const forwardTo = org?.forward_calls_to || org?.forwardCallsTo;
+  if (!org || !forwardTo) {
+    // No catch-all number any more: FORWARD_CALLS_TO is not a routing target for
+    // calls we cannot place. An unroutable call is rejected, not forwarded.
+    console.warn('No forwardable organization for Twilio number:', to, '(org found:', !!org, ')');
+    const voiceResponse = new VoiceResponse();
+    voiceResponse.reject();
+    return res.type('text/xml').send(voiceResponse.toString());
+  }
 
   const twiml = new VoiceResponse();
   const dial = twiml.dial({
@@ -2922,11 +2406,36 @@ app.post('/webhooks/twilio/voice-status', twilioFormParser, verifyTwilioSignatur
     // This is the actual missed-call-to-textback trigger
     try {
       const org = await findOrgByTwilioNumber(to);
-      const orgId = org?.id || inMemoryOrgs[0].id;
-      const techName = org?.technician_name || org?.technicianName || 'Mark';
-      const bizName = org?.name || 'Apex Plumbing & Mechanical';
+      if (!org) {
+        console.warn('Voice status for unknown organization, call:', req.body.CallSid, 'status:', dialStatus);
+        return res.type('text/xml').send(new VoiceResponse().toString());
+      }
+      const orgId = org.id;
+      const callSid = req.body.DialCallSid || req.body.CallSid || '';
+      const techName = org.technician_name || org.technicianName || 'Mark';
+      const bizName = org.name;
 
       const autoSms = `Hey! This is the dispatcher for ${techName} at ${bizName}. ${techName} is currently on a job and can't pick up. What issue are you experiencing today? Reply here and I'll get you on the schedule!`;
+
+      // Idempotency: Twilio retries this callback until it gets a 2xx, so a
+      // second delivery of the same CallSid must not re-text the customer or
+      // duplicate the missed-call record.
+      if (callSid) {
+        let isDuplicate = false;
+        if (pool) {
+          const dupRes = await pool.query(
+            'SELECT id FROM public.missed_calls WHERE twilio_call_sid = $1 LIMIT 1;',
+            [callSid],
+          );
+          isDuplicate = dupRes.rows.length > 0;
+        } else {
+          isDuplicate = inMemoryCalls.some(c => c.twilioCallSid === callSid);
+        }
+        if (isDuplicate) {
+          console.warn('Duplicate voice-status callback, skipping missed-call handling:', callSid);
+          return res.type('text/xml').send(new VoiceResponse().toString());
+        }
+      }
 
       // Trigger instant outbound SMS via Twilio API if credentials are configured
       if (twilioClient) {
@@ -2939,40 +2448,55 @@ app.post('/webhooks/twilio/voice-status', twilioFormParser, verifyTwilioSignatur
 
       // Persist missed call to database or in-memory
       if (pool) {
-        await pool.query(
-          `INSERT INTO public.missed_calls (
-            organization_id, caller_name, caller_phone, ring_duration_seconds,
-            auto_sms_sent, auto_sms_sent_at, converted_to_booking
-          ) VALUES ($1, $2, $3, $4, true, NOW(), false);`,
-          [orgId, 'Caller', from, duration || 15]
-        );
+        await runTenantQuery(pool, orgId, null, async (client) => {
+          // Idempotency re-check inside the tenant context: a second delivery of the same
+          // CallSid must not duplicate the record. (Twilio may still race two callbacks.)
+          if (callSid) {
+            const dupRes = await client.query(
+              'SELECT id FROM public.missed_calls WHERE twilio_call_sid = $1 LIMIT 1;',
+              [callSid],
+            );
+            if (dupRes.rows.length > 0) {
+              console.warn('Duplicate voice-status callback, skipping missed-call handling:', callSid);
+              return; // nothing to write; the outer txn commits nothing
+            }
+          }
 
-        // Ensure an SMS thread exists for this customer so the follow-up text is visible in SMS inbox
-        const thCheck = await pool.query(
-          'SELECT id FROM public.sms_threads WHERE organization_id = $1 AND customer_phone = $2 LIMIT 1;',
-          [orgId, from]
-        );
-
-        let threadId: string;
-        if (thCheck.rows.length === 0) {
-          threadId = crypto.randomUUID ? crypto.randomUUID() : toUuid(`mc-th-${from}-${Date.now()}`);
-          await pool.query(
-            `INSERT INTO public.sms_threads (
-              id, organization_id, customer_name, customer_phone, trade_type, status, last_activity_at
-            ) VALUES ($1, $2, 'Caller', $3, $4, 'active', NOW());`,
-            [threadId, orgId, from, org?.trade || 'plumbing']
+          await client.query(
+            `INSERT INTO public.missed_calls (
+              organization_id, caller_name, caller_phone, ring_duration_seconds,
+              auto_sms_sent, auto_sms_sent_at, converted_to_booking, twilio_call_sid
+            ) VALUES ($1, $2, $3, $4, true, NOW(), false, $5);`,
+            [orgId, 'Caller', from, duration || 15, callSid || null]
           );
-        } else {
-          threadId = thCheck.rows[0].id;
-          await pool.query('UPDATE public.sms_threads SET last_activity_at = NOW() WHERE id = $1;', [threadId]);
-        }
 
-        // Record the outbound auto-SMS in the thread
-        await pool.query(
-          `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag)
-           VALUES ($1, 'assistant', $2, 'slot_offered');`,
-          [threadId, autoSms]
-        );
+          // Ensure an SMS thread exists for this customer so the follow-up text is visible in SMS inbox
+          const thCheck = await client.query(
+            'SELECT id FROM public.sms_threads WHERE organization_id = $1 AND customer_phone = $2 LIMIT 1;',
+            [orgId, from]
+          );
+
+          let threadId: string;
+          if (thCheck.rows.length === 0) {
+            threadId = crypto.randomUUID ? crypto.randomUUID() : toUuid(`mc-th-${from}-${Date.now()}`);
+            await client.query(
+              `INSERT INTO public.sms_threads (
+                id, organization_id, customer_name, customer_phone, trade_type, status, last_activity_at
+              ) VALUES ($1, $2, 'Caller', $3, $4, 'active', NOW());`,
+              [threadId, orgId, from, org.trade || 'plumbing']
+            );
+          } else {
+            threadId = thCheck.rows[0].id;
+            await client.query('UPDATE public.sms_threads SET last_activity_at = NOW() WHERE id = $1;', [threadId]);
+          }
+
+          // Record the outbound auto-SMS in the thread
+          await client.query(
+            `INSERT INTO public.sms_messages (thread_id, sender, text, action_tag)
+             VALUES ($1, 'assistant', $2, 'slot_offered');`,
+            [threadId, autoSms]
+          );
+        });
       } else {
         inMemoryCalls.unshift({
           id: `mc-${Date.now()}`,
@@ -2982,6 +2506,7 @@ app.post('/webhooks/twilio/voice-status', twilioFormParser, verifyTwilioSignatur
           ringDurationSeconds: duration || 15,
           autoSmsSent: true,
           convertedToBooking: false,
+          twilioCallSid: callSid || undefined,
           urgency: 'routine',
           createdAt: new Date().toISOString(),
         });
@@ -3002,6 +2527,7 @@ app.post('/webhooks/twilio/voice-status', twilioFormParser, verifyTwilioSignatur
 app.post(
   '/api/missed-call/process',
   requireAuth,
+  requirePermission('assistant.run'),
   rateLimitPerOrg({ scope: 'missed-call-process' }),
   async (req: Request, res: Response) => {
   try {
@@ -3158,6 +2684,12 @@ async function initDb() {
       );
       CREATE INDEX IF NOT EXISTS idx_users_org ON public.users (organization_id);
       CREATE INDEX IF NOT EXISTS idx_users_email ON public.users (email);
+
+      -- Webhook idempotency: never process the same Twilio MessageSid / CallSid twice.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sms_messages_twilio_message_sid
+        ON public.sms_messages (twilio_message_sid) WHERE twilio_message_sid IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_twilio_call_sid
+        ON public.missed_calls (twilio_call_sid) WHERE twilio_call_sid IS NOT NULL;
     `);
 
     // 3. Enable and FORCE Row Level Security on all tenant tables

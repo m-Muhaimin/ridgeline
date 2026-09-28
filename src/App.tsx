@@ -96,14 +96,8 @@ export default function App() {
     if (showLoading) setIsDataLoading(true);
     const start = Date.now();
     try {
-      const storedToken = localStorage.getItem('ridgeline_session_token');
-      const headers: Record<string, string> = {};
-      if (storedToken) {
-        headers['Authorization'] = `Bearer ${storedToken}`;
-      }
-
       const [data, status] = await Promise.all([
-        apiFetch('/api/neon/data', { headers }).catch(() => null),
+        apiFetch('/api/neon/data').catch(() => null),
         apiFetch('/api/neon/status').catch(() => null)
       ]);
 
@@ -154,23 +148,11 @@ export default function App() {
     async function checkAuth() {
       setIsAuthLoading(true);
       try {
-        const storedToken = localStorage.getItem('ridgeline_session_token');
-        const headers: Record<string, string> = {};
-        if (storedToken) {
-          headers['Authorization'] = `Bearer ${storedToken}`;
-        }
-
-        const data = await apiFetch('/api/auth/me', { headers });
+        const data = await apiFetch('/api/auth/me');
         if (data.user) {
           setCurrentUser(data.user);
-          localStorage.setItem('ridgeline_user_email', data.user.email);
-          if (data.token) {
-            localStorage.setItem('ridgeline_session_token', data.token);
-          }
         } else {
           setCurrentUser(null);
-          localStorage.removeItem('ridgeline_session_token');
-          localStorage.removeItem('ridgeline_user_email');
         }
       } catch (e) {
         console.warn('Auth check skipped:', e);
@@ -186,7 +168,6 @@ export default function App() {
 
   const handleAuthSuccess = (user: User) => {
     setCurrentUser(user);
-    localStorage.setItem('ridgeline_user_email', user.email);
     syncFromNeon(true);
     if (!user.onboardingCompleted) {
       navigate('/onboarding');
@@ -197,18 +178,11 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      const storedToken = localStorage.getItem('ridgeline_session_token');
-      const headers: Record<string, string> = {};
-      if (storedToken) {
-        headers['Authorization'] = `Bearer ${storedToken}`;
-      }
-      await fetch('/api/auth/logout', { method: 'POST', headers, credentials: 'include' });
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     } catch (e) {
       console.warn('Logout error:', e);
     }
     setCurrentUser(null);
-    localStorage.removeItem('ridgeline_session_token');
-    localStorage.removeItem('ridgeline_user_email');
     showToast('Signed out of RidgeLine.');
     navigate('/auth');
   };

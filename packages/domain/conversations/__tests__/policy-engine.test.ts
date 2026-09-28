@@ -131,3 +131,29 @@ test('an emergency still books when auto-confirm is off, and still pages a human
   assert.equal(d.mayWrite, true);
   assert.equal(d.requiresHuman, true);
 });
+
+// --- cancellation and the auto-confirm switch -------------------------------
+// A customer cancelling never states a time. These cover that shape, which is
+// the only shape a cancellation actually arrives in.
+
+const cancelFacts = (over: any = {}) => base({ intent: 'cancel', requestedSlot: null, hasExistingBooking: true, ...over });
+
+for (const slotResolution of ['available', 'unavailable', 'unstated'] as const) {
+  test(`auto-confirm disabled blocks a cancellation (slotResolution ${slotResolution})`, () => {
+    const d = decide(cancelFacts({ slotResolution, autoConfirmEnabled: false }));
+    assert.equal(d.mayWrite, false);
+    assert.equal(d.action, 'cancel', 'the customer still gets a cancellation reply, from a human');
+  });
+}
+
+test('auto-confirm enabled lets a cancellation through', () => {
+  const d = decide(cancelFacts({ slotResolution: 'unstated', autoConfirmEnabled: true }));
+  assert.equal(d.action, 'cancel');
+  assert.equal(d.mayWrite, true);
+});
+
+test('a cancellation still needs a booking on the schedule', () => {
+  const d = decide(cancelFacts({ hasExistingBooking: false, autoConfirmEnabled: true }));
+  assert.equal(d.mayWrite, false);
+  assert.equal(d.action, 'answer');
+});

@@ -70,10 +70,6 @@ export const AuthPage: React.FC<AuthPageProps> = ({
         throw new Error(data.error || 'Authentication failed');
       }
 
-      if (data.token) {
-        localStorage.setItem('ridgeline_session_token', data.token);
-      }
-      localStorage.setItem('ridgeline_user_email', data.user.email);
       showToast(mode === 'login' ? `Welcome back, ${data.user.fullName}!` : `Account created! Welcome to RidgeLine.`);
       onAuthSuccess(data.user);
       navigate('/');
@@ -95,10 +91,6 @@ export const AuthPage: React.FC<AuthPageProps> = ({
         body: JSON.stringify({ email: 'mark@apexplumbingpro.com', password: 'Password123!' }),
       });
       if (data.success && data.user) {
-        if (data.token) {
-          localStorage.setItem('ridgeline_session_token', data.token);
-        }
-        localStorage.setItem('ridgeline_user_email', data.user.email);
         showToast('Logged in as Mark Kowalski (Demo Account)');
         onAuthSuccess(data.user);
         navigate('/');

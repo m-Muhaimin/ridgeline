@@ -122,7 +122,7 @@ export interface User {
   id: string;
   email: string;
   fullName: string;
-  role: 'owner' | 'technician' | 'dispatcher';
+  role: 'owner' | 'admin' | 'dispatcher' | 'technician' | 'viewer';
   organizationId?: string;
   onboardingCompleted: boolean;
   createdAt?: string;

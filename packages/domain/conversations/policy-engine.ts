@@ -70,8 +70,12 @@ export function decide(facts: PolicyFacts): PolicyDecision {
     if (!hasExistingBooking) {
       return NO_WRITE('answer', 'nothing on the schedule to cancel');
     }
-    if (slotResolution === 'available' && !autoConfirmEnabled) {
-      return NO_WRITE('cancel', 'auto-confirm disabled: a human confirms the change');
+    // A cancellation never carries a requested slot, so slotResolution is
+    // always 'unstated' here and gating on it let the one path that matters
+    // through untouched. Cancelling is a change to someone's day, exactly as
+    // moving a booking is, so it obeys the same switch.
+    if (!autoConfirmEnabled) {
+      return NO_WRITE('cancel', 'auto-confirm disabled: a human confirms the cancellation');
     }
     return { action: 'cancel', reason: 'customer asked to cancel an existing booking', mayWrite: true, requiresHuman: false };
   }

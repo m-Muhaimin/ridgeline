@@ -991,11 +991,11 @@ Time saved per operator
 
 ```text
 [x] Extract booking service
-[ ] Extract conversation service
+[x] Extract conversation service
 [x] Extract policy engine
 [x] Extract safety engine
-[ ] Extract tenant context
-[ ] Reduce server.ts
+[x] Extract tenant context
+[~] Reduce server.ts (net 3727 -> ~2801; extraction done, auth/CSRF middleware added back)
 [~] Remove frontend business duplication
 ```
 
@@ -1025,26 +1025,55 @@ Time saved per operator
 >   loader now returns the declared `bookingId` and `customerName`, and the
 >   conflict message is type-checked and still names the customer when known.
 >
-> Still open: the conversation service (2.3) is still methods on `server.ts`,
-> and tenant context (2.5) is still the inlined `runTenantQuery`. Frontend
-> duplication is down, not gone: availability and emergency triage are shared,
-> the rest of the business logic still lives in `App.tsx`.
+> Since that note: the conversation service (2.3) is now
+> `packages/application/conversation-service.ts` (processInboundSms behind a
+> `Queryable` port, SAVEPOINT'd scheduling, the policy-engine cancel/reschedule
+> flow moved in verbatim) with the AI pipeline (`ai-pipeline.ts`) behind it and
+> `id-utils.ts`; tenant context (2.5) is `packages/application/tenant-context.ts`
+> (pool-first `runTenantQuery`, all webhook/server call sites converted).
+> Frontend duplication is down, not gone: availability and emergency triage are
+> shared, the rest of the business logic still lives in `App.tsx`.
 
 ---
 
 ## Sprint 3 — Webhook & Security Hardening
 
 ```text
-[ ] Remove unknown-Twilio fallback
-[ ] Add MessageSid idempotency
-[ ] Add CallSid idempotency
-[ ] Make webhook DB access tenant-aware
-[ ] Harden authorization
-[ ] Remove/limit localStorage JWT
-[ ] Add CSRF/origin protection
+[x] Remove unknown-Twilio fallback
+[x] Add MessageSid idempotency
+[x] Add CallSid idempotency
+[x] Make webhook DB access tenant-aware
+[x] Harden authorization
+[x] Remove/limit localStorage JWT
+[x] Add CSRF/origin protection
 ```
 
 **Exit condition:** repeated/malformed/misrouted external events cannot corrupt tenant data.
+
+> **Done.** Unknown Twilio numbers now fail safely (SMS rejects, voice rejects,
+> voice-status warns and 200s) via `packages/domain/organizations/twilio-phone.ts`.
+> MessageSid and CallSid are idempotency keys (dedupe pre-check + unique indexes
+> in `initDb()` and `supabase/migrations/20260929000000_webhook_idempotency.sql`).
+> Both webhook DB paths run in tenant transactions
+> (`runTenantQuery(pool, orgId, ...)`) so RLS applies to webhook writes. Roles
+> (`packages/domain/organizations/roles.ts`) gate all 13 write routes via
+> `requirePermission` (unknown/legacy roles deny writes; `users.role` defaults
+> to `'owner'`). The localStorage JWT mirror is gone — cookie-only auth. A
+> same-origin guard (`server.ts` ~175-212) rejects cross-origin state-changing
+> `/api/*` calls unless Origin matches Host or `ALLOWED_ORIGINS`/`APP_URL`;
+> `/webhooks/*` are exempt (signature auth). 159 hermetic tests pass; tsc clean.
+>
+> Follow-ups closed after review: (a) the customer-message INSERT in
+> `conversation-service.ts` now runs inside `SAVEPOINT msg` with
+> `ROLLBACK TO SAVEPOINT msg` in the 23505 branch, so a lost unique-index race
+> is absorbed locally and the cache re-read works on real Postgres (tests
+> assert the savepoint lifecycle). (b) The dead `FORWARD_CALLS_TO` line was
+> removed from `.env.example`.
+>
+> Deferred (non-blocking): (c) Voice-status deliberately keeps two dedupe paths
+> (pre-send guard gates the irreversible textback; in-txn re-check closes the
+> persist race — same predicate, unique index backstop; consolidate in a
+> future hardening pass).
 
 ---
 
