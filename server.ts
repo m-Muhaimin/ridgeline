@@ -54,6 +54,7 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+
 const app = express();
 // Hosts (Render, Heroku, PaaS) inject a dynamic port via PORT, so honour it and keep 3000 as the local-dev fallback.
 const injectedPort = Number(process.env.PORT);
@@ -370,6 +371,19 @@ function verifyPassword(password: string, storedHash: string): boolean {
 function isValidUuid(id: any): boolean {
   if (typeof id !== 'string') return false;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
+// job_bookings.scheduled_date is a plain DATE (no timezone). The pg driver
+// returns it as a local-midnight Date (or a 'YYYY-MM-DD' string). Routing it
+// through toISOString() would shift it to UTC and show the previous day in
+// western timezones; format in local time instead.
+function formatCalendarDate(v: unknown): string {
+  if (typeof v === 'string') return v.slice(0, 10);
+  const d = v instanceof Date ? v : new Date(v as any);
+  if (isNaN(d.getTime())) return '';
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
 }
 
 // toUuid itself now lives in packages/application/id-utils.ts, shared with the
@@ -1220,7 +1234,7 @@ app.get('/api/neon/data', requireAuth, async (req: Request, res: Response) => {
         address: b.address,
         tradeType: b.trade_type,
         serviceTitle: b.service_title,
-        date: typeof b.scheduled_date === 'string' ? b.scheduled_date.slice(0, 10) : new Date(b.scheduled_date).toISOString().slice(0, 10),
+        date: formatCalendarDate(b.scheduled_date),
         timeSlot: b.time_slot,
         status: b.status,
         estimateAmount: parseFloat(b.estimate_amount) || 0,
@@ -1641,7 +1655,7 @@ app.post('/api/bookings', requireAuth, requirePermission('bookings.create'), asy
           address: b.address,
           tradeType: b.trade_type,
           serviceTitle: b.service_title,
-          date: typeof b.scheduled_date === 'string' ? b.scheduled_date.slice(0, 10) : new Date(b.scheduled_date).toISOString().slice(0, 10),
+          date: formatCalendarDate(b.scheduled_date),
           timeSlot: b.time_slot,
           status: b.status,
           estimateAmount: parseFloat(b.estimate_amount) || 0,
@@ -1747,7 +1761,7 @@ app.patch('/api/bookings/:id', requireAuth, requirePermission('bookings.update')
               address: b.address,
               tradeType: b.trade_type,
               serviceTitle: b.service_title,
-              date: typeof b.scheduled_date === 'string' ? b.scheduled_date.slice(0, 10) : new Date(b.scheduled_date).toISOString().slice(0, 10),
+              date: formatCalendarDate(b.scheduled_date),
               timeSlot: b.time_slot,
               status: b.status,
               estimateAmount: parseFloat(b.estimate_amount) || 0,
@@ -2653,6 +2667,10 @@ async function initDb() {
       GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ridgeline_app;
       GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ridgeline_app;
       GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO ridgeline_app;
+      -- runTenantQuery() does SET LOCAL ROLE ridgeline_app per transaction; the
+      -- connecting role MUST be a member or the SET fails, aborting the txn and
+      -- 25P02-cascading every query in it. Grant membership to the boot role.
+      GRANT ridgeline_app TO CURRENT_USER;
     `);
 
     // 2. Ensure customers and users tables exist

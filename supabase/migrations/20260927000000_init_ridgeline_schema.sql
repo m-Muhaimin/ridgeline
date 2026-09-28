@@ -42,6 +42,9 @@ GRANT USAGE ON SCHEMA public, app TO ridgeline_app;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ridgeline_app;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ridgeline_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO ridgeline_app;
+-- runTenantQuery() does SET LOCAL ROLE ridgeline_app per transaction; the connecting
+-- role must be a member or the SET fails, aborting the txn (25P02 cascade).
+GRANT ridgeline_app TO CURRENT_USER;
 
 -- ==============================================================================
 -- 2. Custom Enumerations
